@@ -44,7 +44,7 @@ EXPECT = {
     ("win11", "ResPriStaticDb.ebd"): ("superfetch", {"compressed": True,
                                                      "decompressed_size": 63932,
                                                      "size_matches": True}),
-    ("win11", "Trace2.fx"): ("readyboot", {"declared_size": 7795764, "payload_decoded": False}),
+    ("win11", "Trace2.fx"): ("readyboot", {"declared_size": 7795764, "payload_decoded": True}),
     ("win11", "rblayout.xin"): ("readyboot", {"declared_size": 1583772}),
 }
 EXPECTED_COUNTS = {"win10": 5, "win11": 10}      # win10 has no ReadyBoot subdirectory at all
@@ -80,11 +80,24 @@ def main():
             print(f"   {tag}/{name:24} {key:20} {str(got):>10}"
                   f"{'' if ok else f'   << expected {want}'}")
 
-    # ReadyBoot is deliberately not decoded - assert we still say so rather than silently
-    # claiming success on a payload nobody has cracked.
+    # ReadyBoot IS decoded now (docs/readyboot-format.md): a PfB chain of 64 KB XPRESS Huffman
+    # chunks. The decode is exact, so assert exactness - a payload that decodes to anything
+    # other than its declared size means the chunk chain desynchronised, which is precisely the
+    # failure a "did it decode at all" check would wave through.
     for (tag, name), a in found.items():
-        if a.kind == "readyboot" and not a.problems:
-            failures.append(f"{tag}/{name}: readyboot must record that the payload is undecoded")
+        if a.kind != "readyboot":
+            continue
+        if a.problems:
+            failures.append(f"{tag}/{name}: readyboot failed to decode: {a.problems}")
+            continue
+        declared = a.facts.get("declared_size")
+        actual = a.facts.get("decompressed_size")
+        if actual != declared:
+            failures.append(f"{tag}/{name}: decompressed {actual} != declared {declared}")
+        if not a.facts.get("component_count"):
+            failures.append(f"{tag}/{name}: decoded but recovered no name components")
+        print(f"   {tag}/{name:24} {'decoded':20} {actual:>10,} bytes, "
+              f"{a.facts.get('component_count'):,} names")
 
     # Synthetic Layout.ini shapes the corpus cannot provide. The UNC case is a real bug that
     # a drive-letter-only regex silently dropped.

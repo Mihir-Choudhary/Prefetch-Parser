@@ -31,7 +31,10 @@ def run(*args):
 
 
 def check(label, ok, detail=""):
-    print(f"  {label:52} {'ok' if ok else 'FAIL'}{'  ' + detail if detail and not ok else ''}")
+    # str(detail): callers pass counts as well as strings, and a harness that raises TypeError
+    # while reporting a failure hides the failure behind a traceback.
+    print(f"  {label:52} {'ok' if ok else 'FAIL'}"
+          f"{'  ' + str(detail) if detail and not ok else ''}")
     if not ok:
         failures.append(label)
 

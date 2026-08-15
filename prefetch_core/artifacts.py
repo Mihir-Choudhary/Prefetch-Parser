@@ -21,7 +21,8 @@ import struct
 from dataclasses import dataclass, field
 
 from . import container
-from .limits import MAX_ARTIFACT_BYTES
+from .limits import MAX_ARTIFACT_BYTES, MAX_DECOMPRESSED_BYTES
+from .xpress import InvalidCompressedData, decompress_pfb
 
 # `PfPre_*.mkd` is a fixed ring: 12-byte header + 16384 x 12-byte records = 196,620 bytes.
 PFPRE_SLOTS = 16384
@@ -185,26 +186,113 @@ def parse_superfetch(path: str, data: bytes) -> Artifact:
 
 
 def parse_readyboot(path: str, data: bytes) -> Artifact:
-    """ReadyBoot `Trace*.fx` / `rblayout.xin` - `PfB\\xe3` container, payload NOT decoded.
+    """ReadyBoot `Trace*.fx` / `rblayout.xin` - a `PfB\\xe3` chain of XPRESS Huffman chunks.
 
-    The header parses; the payload is compressed (entropy ~7.9 bits/byte) but is not XPRESS
-    Huffman at any offset tried. Recognise it, surface the inventory and the mtime - five traces
-    with distinct mtimes are a boot history in themselves - and do not pretend to read further.
+    The payload decodes to a boot file-access trace: the files the system touched while
+    booting, in the same `\\Device\\HarddiskVolumeN\\` notation `.pf` uses, so the volume
+    correlation applies unchanged. Each trace's mtime dates one boot.
+
+    Caveat that must survive to the UI: like Layout.ini and SuperFetch, this is an *access*
+    artifact, not an execution record, and individual entries carry no timestamps. The file's
+    mtime dates the boot; it does not date any one access inside it.
+
+    A decode failure is reported and the header facts are kept - recognising the file and
+    dating the boot is worth something even when the payload cannot be read.
     """
     art = Artifact(path, "readyboot")
     if len(data) < 12 or data[:4] != READYBOOT_MAGIC:
         art.problems.append("missing PfB magic")
         return art
-    _magic, declared, count = struct.unpack_from("<3I", data, 0)
+    _magic, declared, first_chunk_len = struct.unpack_from("<3I", data, 0)
     art.facts = {
         "declared_size": declared,
-        "count_field": count,
+        # Not a record count: this is the compressed length of the first chunk. It was
+        # mislabelled as a count until the chunk chain was decoded.
+        "first_chunk_len": first_chunk_len,
         "compressed_size": len(data),
         "ratio": round(declared / len(data), 2) if len(data) else 0,
         "payload_decoded": False,
     }
-    art.problems.append("payload compression not identified; inventory and mtime only")
+    try:
+        payload = decompress_pfb(data, max_output=MAX_DECOMPRESSED_BYTES)
+    except (InvalidCompressedData, struct.error) as exc:
+        art.problems.append(f"payload did not decode: {exc}")
+        return art
+
+    art.facts["payload_decoded"] = True
+    art.facts["decompressed_size"] = len(payload)
+    art.paths = _name_components(payload)
+    art.facts["component_count"] = len(art.paths)
     return art
+
+
+# A name record inside the decompressed trace:
+#
+#     u32  linkage field (points at another record; the tree it forms is NOT decoded)
+#     u16  character count
+#          that many UTF-16LE characters
+#
+# Records sit back to back and are 2-byte aligned. Reading the declared length instead of
+# regex-scanning for printable runs matters: a scan cannot see where a name ends, so it
+# swallows the next record's length field as a trailing character and reports `EFI6`,
+# `MicrosoftB`, `BootZ` instead of `EFI`, `Microsoft`, `Boot`.
+_REC_HEADER = 6
+_MAX_NAME_CHARS = 512
+# A single valid-looking record is meaningless in 10 MB of binary; a run of this many
+# consecutive ones is not. This is what keeps false positives out without a checksum.
+_MIN_RUN = 4
+
+
+def _read_record(payload: bytes, pos: int) -> tuple[str, int] | None:
+    """Parse one name record at `pos`. Returns (name, total size) or None."""
+    if pos + _REC_HEADER > len(payload):
+        return None
+    _link, count = struct.unpack_from("<IH", payload, pos)
+    if not 1 <= count <= _MAX_NAME_CHARS:
+        return None
+    end = pos + _REC_HEADER + count * 2
+    if end > len(payload):
+        return None
+    try:
+        name = payload[pos + _REC_HEADER:end].decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+    # Real names are printable and single-line. Rejecting controls is what stops the walk from
+    # running off into binary and emitting noise.
+    if any(ch < " " or ch == "￾" or ch == "￿" for ch in name):
+        return None
+    return name, _REC_HEADER + count * 2
+
+
+def _name_components(payload: bytes) -> list[str]:
+    """Recover path components by walking the name records, de-duplicated, order preserved.
+
+    These are **components**, not full paths: `Windows`, `System32`, `i3chost.sys`. Each record
+    carries a link to another record, but that linkage did not survive validation - only ~23% of
+    the pointers resolved to a record start, and reconstructing from them produced obvious
+    nonsense (`Branding\\Branding\\Branding...`). So the tree is left undecoded and no path is
+    assembled. See docs/readyboot-format.md.
+    """
+    seen: dict[str, None] = {}
+    pos = 0
+    n = len(payload)
+    while pos + _REC_HEADER <= n:
+        run: list[str] = []
+        walk = pos
+        while True:
+            rec = _read_record(payload, walk)
+            if rec is None:
+                break
+            name, size = rec
+            run.append(name)
+            walk += size
+        if len(run) >= _MIN_RUN:
+            for name in run:
+                seen.setdefault(name, None)
+            pos = walk
+        # Records are 2-byte aligned, so resynchronising by 2 cannot step over one.
+        pos += 2
+    return list(seen)
 
 
 PARSERS = {

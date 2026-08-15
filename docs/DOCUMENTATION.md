@@ -251,9 +251,39 @@ that reason.
 | `Layout.ini` | UTF-16 list of files the prefetcher wants laid out contiguously. **The only artifact in the folder with a drive letter**, and on Windows 11 it names user accounts and installed software |
 | `PfPre_<hex>.mkd` | a fixed **16,384-slot event ring buffer**. The header count is events *ever written*, so a count above 16,384 means older events were overwritten. The event types are not decoded |
 | `*.7db`, `*.ebd` | SuperFetch resource-priority databases. One self-validating container; `.ebd` is MAM-compressed. Holds paths in prefetch's own `\VOLUME{serial}` notation |
-| `ReadyBoot/Trace*.fx`, `rblayout.xin` | boot traces. The container is decoded; **the payload is not** (see limitations) |
+| `ReadyBoot/Trace*.fx`, `rblayout.xin` | **per-boot file-access traces.** Fully decompressed — see [ReadyBoot](#readyboot) below. Each file's mtime dates one boot |
 
 Detailed analysis: [`prefetch-artifacts.md`](prefetch-artifacts.md).
+
+### ReadyBoot
+
+Windows 11 keeps a `ReadyBoot/` subfolder of boot traces in a `PfB` container. This tool
+decompresses them; as far as I can tell no other prefetch tool does.
+
+The container is **not** one compressed stream — that is why it resisted decoding for so long.
+It is a chain of independently compressed 64 KB XPRESS Huffman chunks:
+
+```
+u32  magic 0xE3426650 ('PfB\xe3')
+u32  total uncompressed size
+u32  compressed length of chunk 0
+     chunk 0
+     u32 unidentified   u32 length of chunk 1
+     chunk 1
+     ...
+```
+
+Each chunk resets the LZ77 history, so chunks decode independently. The final chunk's declared
+length is **not** valid — it must be clamped to the end of the file.
+
+Verified on all six files in the corpus: each decompresses to exactly its declared size, the
+chunk count equals `ceil(size / 65536)`, and all 708 chunk boundaries land on a complete
+canonical Huffman table. Derivation and evidence: [`readyboot-format.md`](readyboot-format.md).
+
+What comes out is a boot file-access trace — 7,000–14,000 name components per file, including
+device paths (`HarddiskVolume3`), driver-store names, UWP package identities and EFI boot
+files. Same standing caveat as the rest of this section: **access, not execution**, and no
+per-entry timestamps.
 
 ---
 
@@ -408,12 +438,16 @@ multiple locations. The widely repeated "several hashes ⇒ ran from several pla
 heuristic false-positives on `svchost`, `runtimebroker`, `dllhost` and `msedge` on any normal
 system. Compare resolved **paths** instead.
 
-### ReadyBoot payload undecoded
+### ReadyBoot paths are components, not full paths
 
-The `PfB` container header is decoded; the payload is compressed (entropy ≈7.9 bits/byte) and
-is **not** XPRESS Huffman at any offset tried. File inventory and timestamps are reported; the
-contents are not. Earlier documentation claiming ReadyBoot is an ETL trace is wrong — there is
-no ETL magic in these files.
+The `PfB` payload **is** decoded (see [ReadyBoot](#readyboot)), and the file names it contains
+are recovered exactly. What is *not* decoded is the record tree that would join them into
+complete paths: each name record carries a link field, but only ~23% of those links resolve to
+a record start and reconstructing from them produces obvious nonsense, so the tool reports
+components (`Windows`, `System32`, `i3chost.sys`) and assembles no path from them.
+
+The 4-byte field between chunks is also unidentified. It is high-entropy and bears no relation
+to length or count; it is not needed to decode the file.
 
 ### `PfPre_*.mkd` semantics unknown
 

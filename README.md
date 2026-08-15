@@ -11,7 +11,8 @@ and macOS — it does not need Windows to read Windows 10/11 prefetch.
 - **Full executable paths**, from a file field no other tool reads
 - **Nothing skipped** — loaded files with MFT references, every volume, directories, trace
   chains, and a row for files that fail to parse
-- **The rest of the Prefetch folder too** — `Layout.ini`, SuperFetch databases, ReadyBoot
+- **The rest of the Prefetch folder too** — `Layout.ini`, SuperFetch databases, and Windows 11
+  **ReadyBoot boot traces, decompressed** ([format worked out here](docs/readyboot-format.md))
 - **Alternate data streams** — recovers prefetch hidden in an ADS, without pretending the
   carrier's timestamps are its own
 - **GUI** with Excel-style per-column filters, tagging and export; **CLI** for scripting
@@ -35,7 +36,7 @@ how paths are resolved, ADS handling, cross-platform notes, the test suite, and 
 
 ## Status
 
-16 test suites, all passing. Verified against 690 real prefetch files across all five versions,
+17 test suites, all passing. Verified against 690 real prefetch files across all five versions,
 and against an independently written parser built from the format specification.
 
 **Not yet run on Windows.** The Windows-specific code paths — the `ntdll` decompressor and ADS

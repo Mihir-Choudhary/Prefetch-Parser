@@ -191,3 +191,79 @@ def decompress_mam(raw):
     out_size = struct.unpack_from("<I", raw, 4)[0]
     payload = 12 if (flags & 0x80) else 8
     return decompress(raw[payload:], out_size)
+
+
+PFB_MAGIC = b"PfB\xe3"
+_PFB_CHUNK = 65536
+
+
+def decompress_pfb(raw, max_output=None):
+    """Decompress a ReadyBoot `PfB` container (`Trace*.fx`, `rblayout.xin`).
+
+    Unlike MAM, this is not one XPRESS stream - it is a *chain* of independent 64 KB XPRESS
+    Huffman chunks, which is why every whole-stream decode attempt failed:
+
+        u32  magic 0xE3426650 ('PfB\\xe3')
+        u32  total uncompressed size
+        u32  compressed length of chunk 0
+             chunk 0 data
+             u32  unidentified (high entropy; not length or count)
+             u32  compressed length of chunk 1
+             chunk 1 data
+             ...
+
+    Each chunk decompresses to exactly 64 KB (the last to the remainder) and resets the LZ77
+    history, so chunks are decoded independently rather than against a shared window.
+
+    See docs/readyboot-format.md for how this was derived and how it was verified: every chunk
+    start in the corpus lands on a Kraft-complete Huffman table, and all six files decode to
+    exactly their declared size.
+    """
+    if raw[:4] != PFB_MAGIC:
+        raise InvalidCompressedData("not a PfB container")
+    if len(raw) < 12:
+        raise InvalidCompressedData("truncated PfB header")
+    _magic, total, chunk_len = struct.unpack_from("<3I", raw, 0)
+    if total == 0:
+        # The chunk loop would exit immediately and report a clean empty decode. Reporting
+        # "decoded, 0 names" for a corrupt trace is worse than reporting a problem: it tells an
+        # analyst the boot touched nothing.
+        raise InvalidCompressedData("declares zero uncompressed bytes")
+    if max_output is not None and total > max_output:
+        raise InvalidCompressedData(
+            f"declared output {total:,} bytes exceeds the {max_output:,} byte ceiling")
+
+    out = bytearray()
+    pos = 12
+    n = len(raw)
+    while len(out) < total:
+        # A zero-length chunk would leave `pos` stationary and spin this loop forever on a
+        # crafted file; every other guard here is bounds, but this one is liveness.
+        if chunk_len == 0:
+            raise InvalidCompressedData("zero-length chunk")
+        want = min(_PFB_CHUNK, total - len(out))
+        final = want == total - len(out)
+        if pos + chunk_len > n:
+            # The trailer that precedes the LAST chunk does not hold a valid length - the
+            # observed values are wild (4,097,071,853 on Trace2.fx) and differ per file, so the
+            # field is simply undefined once there is no next chunk to describe. The final
+            # chunk runs to EOF. Clamping is safe; accepting the bogus length is not, and a
+            # naive `raw[pos:pos+chunk_len]` hides the whole problem because Python slicing
+            # silently stops at the end of the buffer.
+            if not final:
+                raise InvalidCompressedData(
+                    f"chunk at {pos} claims {chunk_len:,} bytes, past the {n:,} byte file")
+            chunk_len = n - pos
+        produced = decompress(raw[pos:pos + chunk_len], want)
+        if len(produced) != want:
+            raise InvalidCompressedData(
+                f"chunk at {pos} produced {len(produced):,} bytes, expected {want:,}")
+        out += produced
+        pos += chunk_len
+        if len(out) >= total:
+            break
+        if pos + 8 > n:
+            raise InvalidCompressedData("truncated inter-chunk trailer")
+        _unidentified, chunk_len = struct.unpack_from("<2I", raw, pos)
+        pos += 8
+    return bytes(out)

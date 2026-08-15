@@ -159,7 +159,13 @@ the serial can be correlated against the `.pf` volume records.
 near-identical between the two machines while the dynamic ones differ. Same caveat as
 Layout.ini: **access/priority evidence, not execution evidence, and no timestamps.**
 
-## 4. ReadyBoot — structure identified, payload NOT decoded
+## 4. ReadyBoot — **DECODED** (2026-08-15)
+
+> **This section has been superseded. See [`readyboot-format.md`](readyboot-format.md).**
+> The payload is a chain of 64 KB XPRESS Huffman chunks and now decodes to exactly its
+> declared size on all six files. Two claims below were wrong and are kept only to show what
+> changed: the payload is **not** undecodable, and the field at offset 8 is **not** a count —
+> it is the compressed length of the first chunk.
 
 **Win11 only**, in a `ReadyBoot/` subdirectory. All six files share the magic `PfB\xe3`
 (`50 66 42 E3`).
@@ -170,12 +176,12 @@ void.
 
 ```
 offset 0   u32  magic = 0xE3426650  ('PfB\xe3')
-offset 4   u32  size            2.4-9.9 MB, ~3x the file size -> plausibly uncompressed length
-offset 8   u32  count           18,693 - 21,591
-offset 12       payload
+offset 4   u32  total uncompressed size    2.4-9.9 MB, ~3x the file size
+offset 8   u32  compressed length of chunk 0   (NOT a record count)
+offset 12       first chunk, then a repeating [u32 unidentified][u32 next length] chain
 ```
 
-| File | Size | mtime | field@4 | field@8 |
+| File | Size | mtime | uncompressed | chunk-0 length |
 |---|---|---|---|---|
 | `Trace2.fx` | 2,523,375 | 2026-07-18 23:17 | 7,795,764 | 19,934 |
 | `Trace3.fx` | 3,158,061 | 2026-07-19 10:54 | 9,770,700 | 20,427 |
@@ -190,21 +196,23 @@ layout is rewritten when the newest trace is taken. There is **no `Trace1.fx`** 
 numbering is a rotation that has wrapped or slot 1 was reclaimed. Each file plausibly
 corresponds to one boot, which would make this a boot history independent of the event log.
 
-**What did not work.** The payload's first bytes (`94 8A A9 9A 99 99 89 89 97 77 78 79 …`)
-read convincingly as packed 4-bit XPRESS Huffman code lengths — values 7–11 are exactly the
-right range. That is a coincidence of the first 64 bytes. Tried and failed:
+**How it was eventually cracked.** The payload's first bytes
+(`94 8A A9 9A 99 99 89 89 97 77 78 79 …`) read convincingly as packed 4-bit XPRESS Huffman
+code lengths — values 7–11 are exactly the right range. That reading was **correct**, and was
+wrongly dismissed as a coincidence of the first 64 bytes.
 
-- XPRESS Huffman at payload offsets +8, +12, +16 on all six files → `Huffman table overflows
-  2^15 entries` (one file got as far as `incomplete Huffman code: 31210 of 32768`, still a fail).
+The mistake was treating the file as one compressed stream. It is a *chain* of independently
+compressed 64 KB chunks, so a whole-stream decode desynchronises after the first chunk — which
+is why every offset tried produced a table error rather than a clean failure. The measured
+entropy of 7.885 bits/byte was right and simply did not distinguish "one stream" from "many".
 
-Measured instead: **payload entropy is 7.885 bits/byte over all 256 byte values**, with no
-repetition at strides 4/8/12/16/24/32. That is compressed or encrypted data, not a struct
-array — so the answer is a different compression, a chunked framing, or a longer header, not a
-different offset into the same scheme.
+The decisive step was scanning every offset for Kraft-complete Huffman tables instead of
+guessing offsets. Full derivation, the chunk chain, and the verification:
+**[`readyboot-format.md`](readyboot-format.md)**.
 
-**Status: open.** Recognise the format, surface the file inventory and mtimes, do not pretend
-to parse the contents. Cracking this needs either a Windows host to observe ReadyBoot writing
-one, or the `PfB` framing reversed from `sysmain.dll` — neither is in scope now.
+**Status: closed.** All six files decode to exactly their declared size; every chunk boundary
+lands on a complete Huffman table. Path *components* are recovered from the decompressed
+payload. The record tree that would join them into full paths is still not decoded.
 
 ---
 
@@ -213,7 +221,8 @@ one, or the `PfB` framing reversed from `sysmain.dll` — neither is in scope no
 1. **`Layout.ini`** — cheap (UTF-16 INI), high value, and the only source of drive letters.
 2. **`.7db` / `.ebd`** — one container, self-validating, contains paths and volume serials that
    correlate with `.pf`.
-3. **ReadyBoot** — inventory and mtimes only until the payload is understood.
+3. **ReadyBoot** — decodes to a boot file-access trace; surface the recovered name components
+   and the per-boot mtimes. Full paths are not reconstructable yet.
 4. **`PfPre_*.mkd`** — structure is solid but the semantics are unknown; low analyst value.
 
 All four are **access/priority artifacts, not execution records.** They must be visually

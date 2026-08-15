@@ -17,6 +17,7 @@ SUITE=(
     test_csv_coverage    # CSV is a strict superset of PECmd's columns
     test_gui_logic       # GUI filter/sort/tag semantics, headless
     test_artifacts       # non-.pf artifacts match the manual byte-level analysis
+    test_readyboot       # PfB chunk chain decodes exactly; crafted chains are refused
     test_csv_escaping    # list-cell escaping survives hostile filenames
     test_cli_errors      # CLI fails usefully and never discards a run
     test_layering        # core stays Qt-free; frozen-build guards present
