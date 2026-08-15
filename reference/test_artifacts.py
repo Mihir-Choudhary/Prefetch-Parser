@@ -25,9 +25,12 @@ EXPECT = {
     # name -> (kind, facts that must match)
     ("win10", "Layout.ini"): ("layout", {"entries": 89, "boot_volume_letter": "C",
                                          "user_paths": 0, "unc_paths": 0}),
+    # clock_reversals is the second, independent wrap signal: a ring read linearly crosses from
+    # newer entries to older ones exactly once. Win10 has not wrapped, so it must be 0.
     ("win10", "PfPre_cb1e3c5c.mkd"): ("pfpre", {"format_version": 5, "events_written": 2603,
                                                 "slots": 16384, "slots_populated": 2603,
-                                                "wrapped": False}),
+                                                "wrapped": False, "clock_reversals": 0,
+                                                "clock_last": 1503292}),
     ("win10", "cadrespri.7db"): ("superfetch", {"format_version": 3, "size_matches": True,
                                                 "db_type": 19, "paths_found": 13}),
     ("win10", "dynrespri.7db"): ("superfetch", {"db_type": 19, "paths_found": 559}),
@@ -38,8 +41,11 @@ EXPECT = {
                                                        "paths_found": 753}),
     ("win11", "Layout.ini"): ("layout", {"entries": 4268, "user_paths": 357,
                                          "boot_volume_letter": "C"}),
+    # Win11's ring HAS wrapped, so the clock must reverse exactly once - not zero (which would
+    # mean the wrap signal is imaginary) and not many (which would mean it is not a clock).
     ("win11", "PfPre_490977ab.mkd"): ("pfpre", {"events_written": 17779, "wrapped": True,
-                                                "slots_populated": 16384, "events_lost": 1395}),
+                                                "slots_populated": 16384, "events_lost": 1395,
+                                                "clock_reversals": 1}),
     ("win11", "dynrespri.7db"): ("superfetch", {"db_type": 19, "paths_found": 531}),
     ("win11", "ResPriStaticDb.ebd"): ("superfetch", {"compressed": True,
                                                      "decompressed_size": 63932,

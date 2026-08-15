@@ -123,9 +123,21 @@ def parse_pfpre(path: str, data: bytes) -> Artifact:
         art.problems.append(f"expected {expected} bytes for a {PFPRE_SLOTS}-slot ring, "
                             f"found {len(data)}")
     usable = (len(data) - PFPRE_HEADER) // PFPRE_RECORD
-    populated = sum(1 for i in range(usable)
-                    if data[PFPRE_HEADER + i * PFPRE_RECORD:
-                            PFPRE_HEADER + (i + 1) * PFPRE_RECORD] != b"\x00" * PFPRE_RECORD)
+    populated = 0
+    clock: list[int] = []
+    for i in range(usable):
+        off = PFPRE_HEADER + i * PFPRE_RECORD
+        record = data[off:off + PFPRE_RECORD]
+        if record == b"\x00" * PFPRE_RECORD:
+            continue
+        populated += 1
+        clock.append(struct.unpack_from("<I", data, off + 8)[0])
+
+    # The third field is a monotonic clock. Reading a ring that has wrapped linearly walks from
+    # newer entries into older ones exactly once, so a single backwards step corroborates the
+    # wrap independently of the header count - two signals rather than one, which matters
+    # because the count is the only thing otherwise vouching for it.
+    reversals = sum(1 for i in range(len(clock) - 1) if clock[i + 1] < clock[i])
     art.facts = {
         "format_version": version,
         "identifier": f"0x{identifier:08X}",
@@ -134,7 +146,14 @@ def parse_pfpre(path: str, data: bytes) -> Artifact:
         "slots_populated": populated,
         "wrapped": count > usable,
         "events_lost": max(0, count - usable),
+        "clock_first": clock[0] if clock else 0,
+        "clock_last": clock[-1] if clock else 0,
+        "clock_reversals": reversals,
     }
+    if (count > usable) != (reversals > 0):
+        art.problems.append(
+            f"header says wrapped={count > usable} but the clock has {reversals} reversal(s); "
+            "the two wrap signals disagree")
     return art
 
 

@@ -96,9 +96,43 @@ were overwritten.
 The event-id field taking only ~12 values from a fixed range **shared across two unrelated
 machines** makes it an enum of event types, not data.
 
-Not decoded: what the 12 event types mean, and what field 2 holds. Nothing here is obviously
-a FILETIME. The name suggests a prefetch *predictor*; the value to an analyst is currently
-"N events of 12 kinds occurred in this order", which is weak. Low priority.
+### What the three fields are (updated 2026-08-15)
+
+**Field 1 — event type.** Confirmed. Exactly 11 values on Win10 and 12 on Win11, all within
+`0x3E8D49A0`–`0x3E8D49AB`, identical on both machines. Machine-invariant and consecutive means
+a compile-time enum base.
+
+**Field 2 — an identifier shared between installations, not machine data.** This is the new
+result. Counting only values above 1, Win10 holds 47 distinct and Win11 holds 86 — and **27 of
+them are common to both machines**, which are unrelated systems:
+
+```
+0x0a8758da 0x2de86155 0x2e53e318 0x2eb80c14 0x44330089 0x4a483460 0x4f5660f6
+0x50a6beb2 0x58d4d4be 0x59554537 0x5c8c4038 0x65588d61 0x67fe5159 0x68684cb0
+0x71f4b781 0x7659e9fc 0x853afc73 0xb28367fa 0xd17bca6f 0xd5fedbef 0xd828c64a
+0xde1af8a3 0xe10b2949 0xe270127b 0xea89a369 0xf548da1e 0xf5b3514d
+```
+
+Anything machine-specific — an MFT reference, an address, a volume-derived value — cannot
+collide across two installs 27 times. So field 2 identifies something shipped with Windows,
+by hash or by tag. The remaining 20 Win10-only and 59 Win11-only values would then be the
+machine-specific items.
+
+It is **not** a prefetch filename hash: of 107 distinct values across both files, exactly 1
+matches any of the 636 `.pf` filename hashes in the corpora, which is chance. The hash function
+and the strings it consumes are still unknown.
+
+**Field 3 — a monotonic clock, and it proves the ring wraps.** Win10 runs 0 → 1,503,292 with
+**no** decrease across all 2,603 records. Win11 runs 83,207 → 4,487,912 with **exactly one**
+decrease — and Win11 is the file whose header count (17,779) exceeds the 16,384 slots. A single
+step backwards in an otherwise monotonic sequence is exactly what reading a wrapped ring buffer
+linearly produces, so this confirms the wrap independently of the header count.
+
+Read as milliseconds the maxima are 25 minutes and 75 minutes of uptime, which is plausible;
+the median step is 0 (many events share a tick). Millisecond-since-boot is the best fit but
+the unit is not proven.
+
+Still not decoded: which event each of the 12 types is, and what field 2 hashes.
 
 The 8 hex digits in the filename do **not** match the header identifier
 (`cb1e3c5c` vs `0x27A79B2C`), so they are two different values. Unresolved.

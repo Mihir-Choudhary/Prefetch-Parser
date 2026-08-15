@@ -451,9 +451,16 @@ to length or count; it is not needed to decode the file.
 
 ### `PfPre_*.mkd` semantics unknown
 
-The structure is proven (16,384-slot ring, cumulative counter). The ~12 event types and the
-second field are not identified, and the filename's hex digits do not match the header's
-identifier.
+The structure is proven (16,384-slot ring, cumulative counter) and the third field is a
+monotonic clock whose single backwards step confirms the ring wrapped. Field 2 is an
+identifier **shared between unrelated Windows installations** — 27 values appear on both
+corpus machines — so it hashes or tags something shipped with Windows rather than anything
+machine-specific. It is not a prefetch filename hash (1 of 107 values matches any of 636
+corpus hashes, i.e. chance).
+
+Not identified: which event each of the ~12 types represents, and what field 2 hashes. The
+filename's hex digits match neither the header identifier nor any volume serial in the corpus.
+The tool reports the structure and the counts, and claims no semantics.
 
 ### Path conflicts unexplained
 
