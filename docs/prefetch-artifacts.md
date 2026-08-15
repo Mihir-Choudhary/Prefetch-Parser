@@ -54,8 +54,15 @@ against `.pf` filename lists tells you which device string is the boot volume. I
 about any other volume, and the Win11 `.pf` set references more than one. So:
 
 - Infer and label **`C:` for the boot volume only**, marked as inferred.
-- Every other volume still needs external input per §4.3. Do not generalise this into a
-  device→letter mapper.
+- Every other volume still needs external input per §4.3.
+
+> **Superseded once ReadyBoot was decoded (2026-08-15).** The paragraph above is right about
+> Layout.ini *on its own*, and wrong that nothing more is possible. ReadyBoot names tens of
+> thousands of files **per device**; Layout.ini names thousands **per drive letter**. Where the
+> two sets overlap, the device and the letter are the same volume — and on the corpus the
+> discrimination is absolute: **99.3%** of `C:` paths appear under `\Device\HarddiskVolume3`
+> and **0.0%** under any other device. See `correlate_volumes()` and
+> [`readyboot-findings.md`](readyboot-findings.md).
 
 What Win11's user-space lines expose, none of which is in any `.pf`:
 

@@ -179,6 +179,29 @@ def main():
     check("scan_folder still works without a callback",
           len(scan_folder(os.path.dirname(files[0]))) == len(files))
 
+    print("\nvolume identity is correlated across artifacts, and withheld when unsupported:")
+    from prefetch_core.artifacts import correlate_volumes, scan_folder
+    rows = correlate_volumes(scan_folder(corpus.WIN11))
+    check("one drive letter established", len(rows) == 1, len(rows))
+    if rows:
+        row = rows[0]
+        check("C: maps to HarddiskVolume3",
+              row["drive_letter"] == "C:" and row["device"].endswith("HarddiskVolume3"), row)
+        # The whole basis of the claim: one device explains nearly every path and the rest
+        # explain none. A weak margin here would mean the mapping is a coincidence.
+        check("the match is unambiguous", row["match"] > 90 and row["next_best"] < 1,
+              f"{row['match']}% vs {row['next_best']}%")
+        check("volume serial and creation time attached",
+              row.get("volume_serial") == "CC31B5D5" and row.get("volume_created") is not None)
+        check("creation time survives FILETIME precision",
+              row["volume_created"].year == 2020 and row["volume_created"].microsecond == 766196,
+              row.get("volume_created"))
+    if corpus.WIN10:
+        # Win10 has no ReadyBoot at all, so there is nothing to correlate Layout.ini against.
+        # Emitting a guess here would be the failure mode this function exists to avoid.
+        check("no mapping invented without ReadyBoot",
+              correlate_volumes(scan_folder(corpus.WIN10)) == [])
+
     print("\ncrafted name tables cannot hang the parser:")
     from prefetch_core.artifacts import _resolve_paths
     NO_PARENT = 0xFFFFFFFF

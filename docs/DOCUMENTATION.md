@@ -253,7 +253,9 @@ that reason.
 | `*.7db`, `*.ebd` | SuperFetch resource-priority databases. One self-validating container; `.ebd` is MAM-compressed. Holds paths in prefetch's own `\VOLUME{serial}` notation |
 | `ReadyBoot/Trace*.fx`, `rblayout.xin` | **per-boot file-access traces.** Fully decompressed — see [ReadyBoot](#readyboot) below. Each file's mtime dates one boot |
 
-Detailed analysis: [`prefetch-artifacts.md`](prefetch-artifacts.md).
+Detailed analysis: [`prefetch-artifacts.md`](prefetch-artifacts.md). What the decoded ReadyBoot
+data is worth in a case — drive-letter mapping, boot history, shadow-copy access, and the
+caveats that matter: [`readyboot-findings.md`](readyboot-findings.md).
 
 ### ReadyBoot
 

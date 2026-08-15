@@ -417,6 +417,24 @@ def cmd_artifacts(args):
                 print(f"        … {len(a.io_by_path) - 5} more (--paths to list all)")
         for problem in a.problems:
             print(f"    ! {problem}")
+
+    # `\Device\HarddiskVolumeN` is what prefetch records; `C:` is what an analyst needs. This
+    # is the one place in a collected folder where the two can be tied together.
+    from prefetch_core.artifacts import correlate_volumes
+    identities = correlate_volumes(found)
+    if identities:
+        print("\nVolume identity (correlated across artifacts, inferred):")
+        for row in identities:
+            print(f"    {row['drive_letter']} = {row['device']}")
+            print(f"        {row['shared_paths']:,} shared paths — {row['match']}% of "
+                  f"{row['drive_letter']} paths, next best device {row['next_best']}%")
+            if row.get("volume_serial"):
+                created = row.get("volume_created")
+                print(f"        serial {row['volume_serial']}"
+                      + (f", volume created {created:%Y-%m-%d %H:%M:%S} UTC" if created else ""))
+        print("    Derived by correlation, not read from any file. Volumes with no matching\n"
+              "    evidence are omitted rather than guessed.")
+
     # These are access/priority artifacts. Saying so once, plainly, is cheaper than an analyst
     # reading a Layout.ini path as evidence that something executed.
     print(f"\n{len(found)} artifact(s). None of these record execution: they show files the "

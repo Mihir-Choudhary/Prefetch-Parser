@@ -95,9 +95,9 @@ def parse_layout(path: str, data: bytes) -> Artifact:
         "entries": len(art.paths),
         "unc_paths": len(unc),
         "drive_letters": ",".join(letters),
-        # Only the boot volume's letter is knowable from here, and only when exactly one
-        # letter appears. With several, there is nothing to tell them apart, so report none
-        # rather than guessing. Do NOT generalise this into a device->letter map.
+        # From Layout.ini ALONE only the boot volume's letter is knowable, and only when
+        # exactly one letter appears. Correlating these paths against ReadyBoot's per-device
+        # path lists does establish a real device->letter mapping - see correlate_volumes().
         "boot_volume_letter": letters[0] if len(letters) == 1 else "",
         "user_accounts": ",".join(users),
         "system_paths": system,
@@ -537,3 +537,100 @@ def scan_folder(root: str, progress=None) -> list[Artifact]:
             if art is not None:
                 found.append(art)
     return found
+
+
+# --- Cross-artifact correlation -------------------------------------------------------------
+#
+# `\Device\HarddiskVolumeN` is what prefetch records; `C:` is what an analyst needs. The mapping
+# is not in any .pf file, and design notes here previously said it could not be recovered at all
+# beyond guessing the boot volume from Layout.ini's single drive letter.
+#
+# Decoding ReadyBoot changed that. ReadyBoot names tens of thousands of files *per device*, and
+# Layout.ini names thousands *per drive letter*. Where the two sets overlap, the device and the
+# letter are the same volume. On the corpus the discrimination is absolute - 99.3% of Layout.ini's
+# C: paths appear under HarddiskVolume3 and 0.0% under any other device - which is what makes
+# this a match rather than a correlation.
+
+# A letter is only claimed when one device explains most of its paths AND every other device
+# explains essentially none. Anything less is reported as no answer: a wrong drive letter in a
+# forensic report is worse than a missing one.
+_VOL_MATCH_MIN = 0.50
+_VOL_REJECT_MAX = 0.02
+_FILETIME_EPOCH = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _normalise(path: str) -> str:
+    return path.upper().rstrip("\\")
+
+
+def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
+    """Tie together what each artifact knows about the same volume.
+
+    Returns one row per device for which a drive letter could be established, carrying the
+    letter, the shared-path evidence, and - when the folder offers exactly one candidate - the
+    volume serial and creation time. Everything here is **inferred from correlation**, so each
+    row says what it was derived from.
+    """
+    by_device: dict[str, set[str]] = {}
+    for art in artifacts:
+        if art.kind != "readyboot":
+            continue
+        for path in art.paths:
+            if not path.upper().startswith("\\DEVICE\\"):
+                continue
+            rest = path[len("\\Device\\"):]
+            device, _, tail = rest.partition("\\")
+            if tail:
+                by_device.setdefault(device, set()).add(_normalise("\\" + tail))
+
+    by_letter: dict[str, set[str]] = {}
+    for art in artifacts:
+        if art.kind != "layout":
+            continue
+        for path in art.paths:
+            if len(path) > 2 and path[1] == ":":
+                by_letter.setdefault(path[0].upper(), set()).add(_normalise(path[2:]))
+
+    # Serial and creation time come from the SuperFetch \VOLUME{creation-serial} names, which
+    # are the only place in the folder that carries a volume's creation time.
+    volumes: list[tuple[str, datetime.datetime | None]] = []
+    for art in artifacts:
+        if art.kind != "superfetch":
+            continue
+        for name in str(art.facts.get("volumes", "")).split(","):
+            m = re.match(r"\\VOLUME\{([0-9a-fA-F]+)-([0-9a-fA-F]+)\}", name.strip())
+            if not m:
+                continue
+            # Integer division: FILETIME ticks exceed float64's exact range, and dividing in
+            # float silently corrupts the low digits of every timestamp.
+            created = _FILETIME_EPOCH + datetime.timedelta(
+                microseconds=int(m.group(1), 16) // 10)
+            volumes.append((m.group(2).upper(), created))
+
+    rows = []
+    for letter, letter_paths in sorted(by_letter.items()):
+        if not letter_paths:
+            continue
+        scores = {dev: len(letter_paths & paths) / len(letter_paths)
+                  for dev, paths in by_device.items()}
+        if not scores:
+            continue
+        best = max(scores, key=scores.get)
+        others = [s for dev, s in scores.items() if dev != best]
+        if scores[best] < _VOL_MATCH_MIN or any(s > _VOL_REJECT_MAX for s in others):
+            continue
+        row = {
+            "drive_letter": f"{letter}:",
+            "device": f"\\Device\\{best}",
+            "shared_paths": len(letter_paths & by_device[best]),
+            "match": round(scores[best] * 100, 1),
+            "next_best": round(max(others) * 100, 1) if others else 0.0,
+            "basis": "ReadyBoot paths matched against Layout.ini (inferred)",
+        }
+        # Only bind a serial when the folder offers exactly one, otherwise there is nothing to
+        # say which volume it belongs to.
+        if len(volumes) == 1:
+            row["volume_serial"] = volumes[0][0]
+            row["volume_created"] = volumes[0][1]
+        rows.append(row)
+    return rows
