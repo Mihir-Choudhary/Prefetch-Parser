@@ -100,10 +100,10 @@ def main():
         actual = a.facts.get("decompressed_size")
         if actual != declared:
             failures.append(f"{tag}/{name}: decompressed {actual} != declared {declared}")
-        if not a.facts.get("component_count"):
+        if not a.facts.get("paths_found"):
             failures.append(f"{tag}/{name}: decoded but recovered no name components")
         print(f"   {tag}/{name:24} {'decoded':20} {actual:>10,} bytes, "
-              f"{a.facts.get('component_count'):,} names")
+              f"{a.facts.get('paths_found'):,} names")
 
     # Synthetic Layout.ini shapes the corpus cannot provide. The UNC case is a real bug that
     # a drive-letter-only regex silently dropped.

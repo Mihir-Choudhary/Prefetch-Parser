@@ -280,10 +280,23 @@ Verified on all six files in the corpus: each decompresses to exactly its declar
 chunk count equals `ceil(size / 65536)`, and all 708 chunk boundaries land on a complete
 canonical Huffman table. Derivation and evidence: [`readyboot-format.md`](readyboot-format.md).
 
-What comes out is a boot file-access trace — 7,000–14,000 name components per file, including
-device paths (`HarddiskVolume3`), driver-store names, UWP package identities and EFI boot
-files. Same standing caveat as the rest of this section: **access, not execution**, and no
-per-entry timestamps.
+Inside sits a **directory tree** — records of `[u32 parent offset][u16 length][UTF-16LE name]`
+— which resolves into whole paths. Two inner formats put that table in opposite places:
+`xFcE` (the traces) keeps it last, `iLdR` (`rblayout.xin`) first at offset 16.
+
+Every link resolves on every file — 8,927 to 20,179 paths each, none dropped:
+
+```
+\Device\HarddiskVolume3\Windows\System32\ntoskrnl.exe
+\Device\HarddiskVolume3\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+\Device\HarddiskVolume1\EFI\Microsoft\Boot\ko-KR\bootmgfw.efi.mui
+\Device\HarddiskVolume3\$Mft
+```
+
+They use the same `\Device\HarddiskVolumeN\` notation as `.pf`, so the volume correlation
+applies unchanged. Same standing caveat as the rest of this section: **access, not execution**,
+and no per-entry timestamps — the trace's mtime dates the boot, nothing dates an entry inside
+it.
 
 ---
 
@@ -438,16 +451,17 @@ multiple locations. The widely repeated "several hashes ⇒ ran from several pla
 heuristic false-positives on `svchost`, `runtimebroker`, `dllhost` and `msedge` on any normal
 system. Compare resolved **paths** instead.
 
-### ReadyBoot paths are components, not full paths
+### ReadyBoot per-access data is not decoded
 
-The `PfB` payload **is** decoded (see [ReadyBoot](#readyboot)), and the file names it contains
-are recovered exactly. What is *not* decoded is the record tree that would join them into
-complete paths: each name record carries a link field, but only ~23% of those links resolve to
-a record start and reconstructing from them produces obvious nonsense, so the tool reports
-components (`Windows`, `System32`, `i3chost.sys`) and assembles no path from them.
+The container, the chunk chain, the name table and the path tree are all decoded, and every
+path resolves (see [ReadyBoot](#readyboot)). What is *not* decoded is the bulk of the payload
+that precedes the name table — roughly 7 MB of `Trace2.fx`'s 7.8 MB. That region should hold
+the per-access records (which file, when, how much was read); mapping it would turn the path
+list into a boot timeline. Until then ReadyBoot tells you **which** files a boot touched, not
+in what order or when.
 
-The 4-byte field between chunks is also unidentified. It is high-entropy and bears no relation
-to length or count; it is not needed to decode the file.
+The 4-byte field between chunks is also unidentified — high entropy, no relation to length or
+count. It is not needed to decode the file.
 
 ### `PfPre_*.mkd` semantics unknown
 

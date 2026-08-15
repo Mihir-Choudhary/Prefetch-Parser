@@ -402,11 +402,7 @@ def cmd_artifacts(args):
         for k, v in a.facts.items():
             print(f"    {k:22} {v}")
         if a.paths:
-            # ReadyBoot yields path *components* (`Windows`, `System32`), not whole paths -
-            # the record tree that would join them is not decoded. Labelling them "paths"
-            # would invite an analyst to read a bare component as a location on disk.
-            label = "name components" if a.kind == "readyboot" else "paths"
-            print(f"    {label:22} {len(a.paths)}")
+            print(f"    {'paths':22} {len(a.paths)}")
             for p in (a.paths if args.paths else a.paths[:3]):
                 print(f"        {p}")
             if not args.paths and len(a.paths) > 3:

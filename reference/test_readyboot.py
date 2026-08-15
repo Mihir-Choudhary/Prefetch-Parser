@@ -102,16 +102,54 @@ def main():
         check(f"{name}: {chunks} chunks, none misaligned",
               bad == 0 and chunks == expected, f"{bad} bad, expected {expected} chunks")
 
-    print("\nname components are cut at the declared length, not scanned for:")
+    print("\nthe name table resolves into whole paths, with nothing dropped:")
     from prefetch_core.artifacts import parse_artifact
-    trace = next((p for p in files if os.path.basename(p).startswith("Trace")), None)
+    for path in files:
+        art = parse_artifact(path)
+        name = os.path.basename(path)
+        records = art.facts.get("name_records") or 0
+        found = art.facts.get("paths_found") or 0
+        # Every record must produce a path. A partial resolution rate is the symptom of
+        # locating the table at the wrong origin - which is exactly what an early attempt did,
+        # resolving 23% and reconstructing nonsense.
+        check(f"{name}: {records:,} records all resolve",
+              records > 0 and found == records and art.facts.get("broken_links") == 0,
+              f"{found} paths, {art.facts.get('broken_links')} broken")
+
+    trace = next(p for p in files if os.path.basename(p).startswith("Trace"))
     art = parse_artifact(trace)
-    names = set(art.paths)
-    # A printable-run scan swallows the next record's length field as a trailing character,
-    # producing these instead of the real component names.
-    for bad_name, good in (("EFI6", "EFI"), ("MicrosoftB", "Microsoft"), ("BootZ", "Boot")):
-        check(f"{good!r} recovered, {bad_name!r} not",
-              good in names and bad_name not in names)
+    paths = set(art.paths)
+    check("paths are whole and rooted at \\Device",
+          all(p.startswith("\\") for p in art.paths)
+          and any(p.startswith("\\Device\\HarddiskVolume") for p in art.paths))
+    # A printable-run scan cannot see where a name ends and swallows the next record's length
+    # field, yielding 'EFI6' / 'MicrosoftB'. Whole paths must contain neither.
+    check("no scan artefacts in any component",
+          not any("EFI6" in p or "MicrosoftB" in p or "BootZ" in p for p in paths))
+    check("a known boot path is present",
+          any(p.endswith("\\Windows\\System32\\ntoskrnl.exe") for p in paths))
+
+    print("\ncrafted name tables cannot hang the parser:")
+    from prefetch_core.artifacts import _resolve_paths
+    NO_PARENT = 0xFFFFFFFF
+    # A record that is its own parent, and a two-record loop. A naive parent walk never
+    # terminates on either.
+    self_loop = {0: ("a", 0)}
+    two_cycle = {0: ("a", 10), 10: ("b", 0)}
+    dangling = {0: ("a", 9999)}
+    deep = {i * 10: (f"d{i}", (i - 1) * 10 if i else NO_PARENT) for i in range(500)}
+    for label, table, expect_paths in (
+        ("self-referencing record", self_loop, 0),
+        ("two-record cycle", two_cycle, 0),
+        ("link to a non-existent record", dangling, 0),
+        ("500-deep chain is capped", deep, None),
+    ):
+        try:
+            out, broken = _resolve_paths(table)
+            ok = True if expect_paths is None else len(out) == expect_paths
+            check(f"{label}: terminates", ok, f"{len(out)} paths, {broken} broken")
+        except RecursionError as exc:
+            check(f"{label}: terminates", False, str(exc))
 
     print("\ncrafted containers are refused, not hung or over-read:")
     good_chunk = None

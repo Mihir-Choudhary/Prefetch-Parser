@@ -240,78 +240,119 @@ def parse_readyboot(path: str, data: bytes) -> Artifact:
 
     art.facts["payload_decoded"] = True
     art.facts["decompressed_size"] = len(payload)
-    art.paths = _name_components(payload)
-    art.facts["component_count"] = len(art.paths)
+    art.facts["inner_format"] = payload[:4].decode("latin-1") if len(payload) >= 4 else ""
+
+    bounds = _name_table_bounds(payload)
+    if bounds is None:
+        art.problems.append("payload decoded but its inner format is not recognised; "
+                            "no paths recovered")
+        return art
+    records = _read_table(payload, *bounds)
+    art.facts["name_records"] = len(records)
+    if not records:
+        art.problems.append("name table located but held no readable records")
+        return art
+
+    art.paths, broken = _resolve_paths(records)
+    art.facts["paths_found"] = len(art.paths)
+    art.facts["broken_links"] = broken
+    if broken:
+        art.problems.append(f"{broken} of {len(records)} records have an unresolvable parent "
+                            "link; those paths were dropped rather than guessed")
     return art
 
 
-# A name record inside the decompressed trace:
+# The decompressed payload ends (or, for rblayout, begins) with a **name table**: a directory
+# tree stored as back-to-back records, each naming one path component and pointing at its
+# parent.
 #
-#     u32  linkage field (points at another record; the tree it forms is NOT decoded)
+#     u32  parent's offset within the table, or 0xFFFFFFFF for a root
 #     u16  character count
 #          that many UTF-16LE characters
 #
-# Records sit back to back and are 2-byte aligned. Reading the declared length instead of
-# regex-scanning for printable runs matters: a scan cannot see where a name ends, so it
-# swallows the next record's length field as a trailing character and reports `EFI6`,
-# `MicrosoftB`, `BootZ` instead of `EFI`, `Microsoft`, `Boot`.
+# Walking it yields whole paths in `\Device\HarddiskVolumeN\...` notation - the same notation
+# `.pf` uses, so the volume correlation applies unchanged.
 _REC_HEADER = 6
 _MAX_NAME_CHARS = 512
-# A single valid-looking record is meaningless in 10 MB of binary; a run of this many
-# consecutive ones is not. This is what keeps false positives out without a checksum.
-_MIN_RUN = 4
+_NO_PARENT = 0xFFFFFFFF
+
+# Two different inner formats travel inside the same PfB container, and they put the name table
+# in opposite places - so the table cannot be found by one rule, or by scanning.
+_XFCE_MAGIC = 0x45634678      # 'xFcE' - the boot traces, table LAST, size at offset 16
+_RDLI_MAGIC = 0x52644C69      # 'RdLi' - rblayout.xin, table FIRST at offset 16, size at 8
+
+# A path nested deeper than this is a corrupt or hostile link chain, not a real path.
+_MAX_DEPTH = 128
 
 
-def _read_record(payload: bytes, pos: int) -> tuple[str, int] | None:
-    """Parse one name record at `pos`. Returns (name, total size) or None."""
-    if pos + _REC_HEADER > len(payload):
+def _name_table_bounds(payload: bytes) -> tuple[int, int] | None:
+    """Locate the name table from the inner header. Returns (start, end) or None."""
+    if len(payload) < 20:
         return None
-    _link, count = struct.unpack_from("<IH", payload, pos)
-    if not 1 <= count <= _MAX_NAME_CHARS:
-        return None
-    end = pos + _REC_HEADER + count * 2
-    if end > len(payload):
-        return None
-    try:
-        name = payload[pos + _REC_HEADER:end].decode("utf-16-le")
-    except UnicodeDecodeError:
-        return None
-    # Real names are printable and single-line. Rejecting controls is what stops the walk from
-    # running off into binary and emitting noise.
-    if any(ch < " " or ch == "￾" or ch == "￿" for ch in name):
-        return None
-    return name, _REC_HEADER + count * 2
+    magic = struct.unpack_from("<I", payload, 0)[0]
+    if magic == _XFCE_MAGIC:
+        size = struct.unpack_from("<I", payload, 16)[0]
+        if not 0 < size <= len(payload) - 20:
+            return None
+        return len(payload) - size, len(payload)
+    if magic == _RDLI_MAGIC:
+        size = struct.unpack_from("<I", payload, 8)[0]
+        if not 0 < size <= len(payload) - 16:
+            return None
+        return 16, 16 + size
+    return None
 
 
-def _name_components(payload: bytes) -> list[str]:
-    """Recover path components by walking the name records, de-duplicated, order preserved.
+def _read_table(payload: bytes, start: int, end: int) -> dict[int, tuple[str, int]]:
+    """Parse the name table into {offset within table: (name, parent offset)}."""
+    records: dict[int, tuple[str, int]] = {}
+    pos = start
+    while pos + _REC_HEADER <= end:
+        parent, count = struct.unpack_from("<IH", payload, pos)
+        if not 1 <= count <= _MAX_NAME_CHARS:
+            break
+        stop = pos + _REC_HEADER + count * 2
+        if stop > end:
+            break
+        try:
+            name = payload[pos + _REC_HEADER:stop].decode("utf-16-le")
+        except UnicodeDecodeError:
+            break
+        # Real components are printable and single-line; a control character means the walk has
+        # left the table and is reading binary.
+        if any(ch < " " for ch in name):
+            break
+        records[pos - start] = (name, parent)
+        pos = stop
+    return records
 
-    These are **components**, not full paths: `Windows`, `System32`, `i3chost.sys`. Each record
-    carries a link to another record, but that linkage did not survive validation - only ~23% of
-    the pointers resolved to a record start, and reconstructing from them produced obvious
-    nonsense (`Branding\\Branding\\Branding...`). So the tree is left undecoded and no path is
-    assembled. See docs/readyboot-format.md.
+
+def _resolve_paths(records: dict[int, tuple[str, int]]) -> tuple[list[str], int]:
+    """Join records into whole paths. Returns (paths, count of unresolvable links).
+
+    Cycle-safe: a crafted table can point a record at itself or form a loop, which would hang
+    a naive parent walk. Depth is capped and visited offsets are tracked per path.
     """
-    seen: dict[str, None] = {}
-    pos = 0
-    n = len(payload)
-    while pos + _REC_HEADER <= n:
-        run: list[str] = []
-        walk = pos
-        while True:
-            rec = _read_record(payload, walk)
-            if rec is None:
+    paths: list[str] = []
+    broken = 0
+    for offset in sorted(records):
+        parts: list[str] = []
+        seen: set[int] = set()
+        cursor = offset
+        ok = True
+        while cursor != _NO_PARENT:
+            if cursor in seen or len(parts) >= _MAX_DEPTH or cursor not in records:
+                ok = cursor == _NO_PARENT
                 break
-            name, size = rec
-            run.append(name)
-            walk += size
-        if len(run) >= _MIN_RUN:
-            for name in run:
-                seen.setdefault(name, None)
-            pos = walk
-        # Records are 2-byte aligned, so resynchronising by 2 cannot step over one.
-        pos += 2
-    return list(seen)
+            seen.add(cursor)
+            name, parent = records[cursor]
+            parts.append(name)
+            cursor = parent
+        if not ok:
+            broken += 1
+            continue
+        paths.append("\\" + "\\".join(reversed(parts)))
+    return paths, broken
 
 
 PARSERS = {

@@ -83,26 +83,69 @@ an ambiguity a scan alone cannot resolve, and the one that desynchronised an ear
 The trailer chain picks 101,925, and the following chunk then decodes cleanly. The two methods
 are independent, which is what makes the result trustworthy rather than merely fitted.
 
-## What is inside
+## What is inside — the name table
 
-The decompressed payload is a **boot file-access trace**, and it is rich:
+The decompressed payload holds a **directory tree**, stored as a table of back-to-back records:
 
 ```
-offset 0   u32   magic  0x45634678  ('xFcE')
-...        'DMIO:ID:' followed by a 16-byte disk GUID
+u32  parent's offset within the table, or 0xFFFFFFFF for a root
+u16  character count
+     that many UTF-16LE characters
 ```
 
-`Trace2.fx` alone yields **11,620 UTF-16LE strings**, including:
+Two different inner formats travel inside the same `PfB` container, and they put the table in
+**opposite** places, so no single rule or scan finds both:
 
-- Device paths in prefetch's own notation — `Device`, `HarddiskVolume1`, `HarddiskVolume3`
-- Full file paths — `Windows\System32\DriverStore\FileRepository\i3chost.inf_amd64_...`
-- UWP package identity —
-  `Microsoft.LanguageExperiencePacken-GB_26100.135.253.0_neutral__8wekyb3d8bbwe`
-- EFI boot artifacts — `EFI\Microsoft\Boot\bootmgfw.efi.mui`
-- Even `.pf` filenames — `AM_DELTA_PATCH_1.455.104.0.EX-6F772A54.pf`
+| Inner magic | Files | Name table | Table size from |
+|---|---|---|---|
+| `xFcE` (`0x45634678`) | `Trace2-6.fx` | **last** in the payload, ending exactly at EOF | u32 at offset 16 |
+| `iLdR` (`0x52644C69`) | `rblayout.xin` | **first**, starting at offset 16 | u32 at offset 8 |
 
-Because the paths use the same `\Device\HarddiskVolumeN\` notation as `.pf` records, the
-existing volume-correlation logic applies unchanged.
+The `xFcE` header also carries `DMIO:ID:` followed by a 16-byte disk GUID, length-prefixed at
+offset 20.
+
+### Finding the table, and why the first attempt failed
+
+An early attempt walked records from an arbitrary point in the middle of the table and then
+brute-forced the origin. It resolved **23%** of links and reconstructed obvious nonsense
+(`\Branding\Branding\Branding…`), which looked like proof that the linkage was undecodable.
+
+It was not. Starting mid-table means every link pointing *backwards* to an earlier record has
+nothing to resolve against, so a correct format produces a low score anyway. The fix was to
+derive the origin arithmetically instead of fitting it: children of `HarddiskVolume3` link to
+274, so that record sits at table offset 274, so the table begins 274 bytes earlier. That
+address lands exactly on a record whose parent is `0xFFFFFFFF` and whose name is `Device` — the
+root. The derived table size then matched the header field exactly, which is what turned a
+guess into a rule.
+
+**Result: every link resolves, on every file.**
+
+| File | Records | Paths | Broken links |
+|---|---|---|---|
+| `Trace2.fx` | 11,733 | 11,733 | 0 |
+| `Trace3.fx` | 11,607 | 11,607 | 0 |
+| `Trace4.fx` | 10,233 | 10,233 | 0 |
+| `Trace5.fx` | 8,927 | 8,927 | 0 |
+| `Trace6.fx` | 11,605 | 11,605 | 0 |
+| `rblayout.xin` | 20,179 | 20,179 | 0 |
+
+### What comes out
+
+Whole paths, in the same `\Device\HarddiskVolumeN\` notation `.pf` uses, so the existing volume
+correlation applies unchanged:
+
+```
+\Device\HarddiskVolume1\EFI\Microsoft\Boot\ko-KR\bootmgfw.efi.mui
+\Device\HarddiskVolume3\Windows\System32\ntoskrnl.exe
+\Device\HarddiskVolume3\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+\Device\HarddiskVolume3\Windows\System32\DriverStore\FileRepository\i3chost.inf_amd64_…\i3chost.sys
+\Device\HarddiskVolume3\Program Files\WindowsApps\Microsoft.LanguageExperiencePacken-GB_…
+\Device\HarddiskVolume3\$Mft            (rblayout.xin)
+\Device\HarddiskVolume3\System Volume Information\FVE2.{…}   (BitLocker metadata)
+```
+
+Reconstruction is cycle-safe: a crafted table can point a record at itself or form a loop, so
+visited offsets are tracked per path and depth is capped at 128.
 
 ## Why this matters for the tool
 
@@ -117,8 +160,13 @@ date any individual file access within it.
 
 ## Still open
 
-- The 4-byte inter-chunk field. High-entropy, no relation to length or count; consistent with
-  a checksum but unconfirmed. It is not needed to decode the file.
-- The record structure *inside* the decompressed payload. The strings are extractable now, but
-  the surrounding binary layout (`xFcE` header, record framing) is not yet mapped, so file
-  paths can be recovered while per-record metadata cannot.
+- The 4-byte inter-chunk field. High entropy, no relation to length or count. **Unidentified** —
+  a checksum is a guess, not a finding. It is not needed to decode the file.
+- The region of the `xFcE` payload *before* the name table (about 7 MB of the 7.8 MB in
+  `Trace2.fx`). This is the per-access data — presumably which file was touched, when, and how
+  much was read — and it is not mapped. Recovering it would turn the path list into a timeline.
+- The two remaining `xFcE` header dwords at offsets 8 and 12 (105,535 and 67,874 in
+  `Trace2.fx`).
+
+What is **not** open any more: the compression, the chunk chain, the name table, and the path
+tree. Those are decoded and verified.

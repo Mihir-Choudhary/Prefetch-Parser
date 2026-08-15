@@ -245,8 +245,10 @@ guessing offsets. Full derivation, the chunk chain, and the verification:
 **[`readyboot-format.md`](readyboot-format.md)**.
 
 **Status: closed.** All six files decode to exactly their declared size; every chunk boundary
-lands on a complete Huffman table. Path *components* are recovered from the decompressed
-payload. The record tree that would join them into full paths is still not decoded.
+lands on a complete Huffman table. The name table inside is a directory tree, and **every link
+resolves on every file** — 8,927 to 20,179 whole paths each, none dropped. What remains
+undecoded is the per-access data preceding the name table, which would supply ordering and
+timing.
 
 ---
 
