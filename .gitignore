@@ -1,0 +1,23 @@
+# Working notes, not part of the deliverable
+AUDIT.md
+STATE.md
+CONTINUE.md
+sessions/
+
+# Third-party material - not ours to redistribute.
+# reference/pf-corpus/ is Eric Zimmerman's published Prefetch test corpus:
+#     https://github.com/EricZimmerman/Prefetch
+# reference/Prefetch-lib-src/ and reference/Test*.cs are that project's source and NUnit tests,
+# vendored locally while reverse-engineering the format. Fetch them yourself if you want to
+# run the suites that use them.
+reference/pf-corpus/
+reference/Prefetch-lib-src/
+reference/Test*.cs
+
+__pycache__/
+*.pyc
+.venv*/
+build/
+dist/
+*.db
+*.csv
