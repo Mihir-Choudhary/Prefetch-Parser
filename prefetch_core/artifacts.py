@@ -288,11 +288,22 @@ def parse_readyboot(path: str, data: bytes) -> Artifact:
     art.facts["io_files_touched"] = len(by_name)
     art.facts["io_first_tick"] = first
     art.facts["io_last_tick"] = last
-    unresolved = sum(n for off, (n, _b) in by_name.items() if off not in records)
-    art.facts["io_unattributed"] = unresolved
+    span = (last or 0) - (first or 0)
+    art.facts["io_span_ticks"] = span
+    # The unit is not stated in the file, but two independent constraints pin it at
+    # microseconds. Read as us the five corpus traces span 35-81 s at 100-256 MB/s - a normal
+    # boot on an SSD. Read as ms they would be 10-22 HOUR traces averaging 0.1 MB/s, which no
+    # boot and no disk does. Derived, not read, so it is named as an inference.
+    art.facts["io_seconds_assuming_us"] = round(span / 1_000_000, 1)
     art.io_by_path = sorted(
         ((_path_for(records, off), n, b) for off, (n, b) in by_name.items()),
         key=lambda row: row[2], reverse=True)
+    # Reads the tracer could not tie to a file. These are not decode failures - they resolve
+    # perfectly, to a marker name the tracer itself writes - and they dominate early boot,
+    # before the filesystem is available. Counting unresolvable offsets instead would report 0
+    # and tell an analyst nothing.
+    art.facts["io_unattributed"] = sum(
+        n for path, n, _b in art.io_by_path if path.rstrip("\\").endswith("FI_UNKNOWN"))
     return art
 
 

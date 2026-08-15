@@ -222,9 +222,10 @@ Heaviest reads from one real boot:
     6 reads  153.9 MB  \Device\HarddiskVolume3\Windows\System32\DriverStore\...\amdkmdag.sys
 ```
 
-About 31% of events resolve to `FI_UNKNOWN`, a real entry in the name table. These are reads
+14-22.5% of events resolve to `FI_UNKNOWN`, a real entry in the name table. These are reads
 the tracer could not attribute to a file — dominated by early boot, before the filesystem is
-available — and their offset field is a volume offset rather than a file offset.
+available — and their offset field is a volume offset rather than a file offset. They are not
+decode failures: they resolve perfectly, to a marker the tracer itself writes.
 
 ## Still open
 
@@ -232,8 +233,24 @@ available — and their offset field is a volume offset rather than a file offse
   a checksum is a guess, not a finding, and it is not needed to decode the file.
 - Three record fields: the two flag words and the last dword. The flags take 7 and 2 distinct
   values; the constant `402` never varies in any record on any trace.
-- The tick unit. It is monotonic and matches the shape of the `PfPre` clock, but nothing in the
-  file states its unit, so the tool reports raw ticks and does not convert to seconds.
+### The tick unit — inferred, not read
+
+Nothing in the file states it, but two independent physical constraints agree on
+**microseconds**:
+
+| Trace | Span (ticks) | Bytes | As µs | As ms |
+|---|---|---|---|---|
+| `Trace2.fx` | 78,295,611 | 8,161 MB | 78.3 s @ 104 MB/s | 21.7 h @ 0.10 MB/s |
+| `Trace3.fx` | 34,735,772 | 8,903 MB | 34.7 s @ 256 MB/s | 9.6 h @ 0.26 MB/s |
+| `Trace4.fx` | 37,025,421 | 7,544 MB | 37.0 s @ 204 MB/s | 10.3 h @ 0.20 MB/s |
+| `Trace5.fx` | 80,561,446 | 8,039 MB | 80.6 s @ 100 MB/s | 22.4 h @ 0.10 MB/s |
+| `Trace6.fx` | 51,515,953 | 6,971 MB | 51.5 s @ 135 MB/s | 14.3 h @ 0.14 MB/s |
+
+Microseconds give 35–81 second traces reading at 100–256 MB/s — an ordinary SSD boot.
+Milliseconds would make every trace a 10–22 hour recording averaging 0.1 MB/s, which is not a
+boot and not any disk. The tool still stores raw ticks; the derived figure is reported as
+`io_seconds_assuming_us` so the inference is visible in the name rather than hidden in a
+converted number.
 
 What is **not** open any more: the compression, the chunk chain, the name table, the path tree,
 and the I/O trace itself.

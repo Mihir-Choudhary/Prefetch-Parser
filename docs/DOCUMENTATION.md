@@ -307,8 +307,9 @@ file**. The tool reports per-file totals, heaviest first:
   150 reads  268.1 MB  ...\Windows Defender\Definition Updates\{...}\mpasbase.vdm
 ```
 
-About 31% of events belong to `FI_UNKNOWN` — reads the tracer could not attribute to a file,
-mostly from early boot before the filesystem is up.
+14-22.5% of events belong to `FI_UNKNOWN` — reads the tracer could not attribute to a file,
+mostly from early boot before the filesystem is up. That is the tracer's own marker, not a
+decode failure.
 
 Standing caveat: this is **access, not execution**. A path here means the boot read that file,
 never that a program ran. Events are ordered and relatively timed by their ticks, but the tick
@@ -474,9 +475,10 @@ The container, chunk chain, name table, path tree and I/O trace are all decoded 
 small: two flag words and the last dword of each I/O record, a constant `402` that never
 varies, and the 4-byte field between chunks.
 
-The event **tick unit** is also unknown. Ticks are monotonic, so ordering and relative timing
-are sound, but nothing in the file states whether a tick is a millisecond or something else —
-so the tool reports raw ticks and converts nothing.
+The event **tick unit** is inferred rather than read. Two physical constraints put it at
+microseconds — that reading gives 35–81 second traces at 100–256 MB/s, where milliseconds would
+give 10–22 hour traces at 0.1 MB/s — but the file never states it. Raw ticks are stored, and
+the derived figure is named `io_seconds_assuming_us` so the assumption is visible.
 
 ### `PfPre_*.mkd` semantics unknown
 
