@@ -246,9 +246,11 @@ guessing offsets. Full derivation, the chunk chain, and the verification:
 
 **Status: closed.** All six files decode to exactly their declared size; every chunk boundary
 lands on a complete Huffman table. The name table inside is a directory tree, and **every link
-resolves on every file** — 8,927 to 20,179 whole paths each, none dropped. What remains
-undecoded is the per-access data preceding the name table, which would supply ordering and
-timing.
+resolves on every file** — 8,927 to 20,179 whole paths each, none dropped.
+
+The rest of the payload is the I/O trace: one 40-byte record per read, carrying the file, the
+byte offset, the size and a monotonic tick. 173,000–229,000 events per boot, 7–9 GB of reads,
+and every event resolves to a named file. See `readyboot-format.md`.
 
 ---
 
@@ -257,8 +259,8 @@ timing.
 1. **`Layout.ini`** — cheap (UTF-16 INI), high value, and the only source of drive letters.
 2. **`.7db` / `.ebd`** — one container, self-validating, contains paths and volume serials that
    correlate with `.pf`.
-3. **ReadyBoot** — decodes to a boot file-access trace; surface the recovered name components
-   and the per-boot mtimes. Full paths are not reconstructable yet.
+3. **ReadyBoot** — fully decoded: whole paths plus a per-read I/O trace with sizes and ordering.
+   The richest artifact in the folder after `.pf` itself.
 4. **`PfPre_*.mkd`** — structure is solid but the semantics are unknown; low analyst value.
 
 All four are **access/priority artifacts, not execution records.** They must be visually

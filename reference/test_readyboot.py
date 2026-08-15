@@ -129,6 +129,28 @@ def main():
     check("a known boot path is present",
           any(p.endswith("\\Windows\\System32\\ntoskrnl.exe") for p in paths))
 
+    print("\nthe I/O trace decodes, and its event count matches the header exactly:")
+    import struct as _s
+    from prefetch_core.xpress import decompress_pfb as _dc
+    for path in files:
+        name = os.path.basename(path)
+        art = parse_artifact(path)
+        with open(path, "rb") as fh:
+            payload = _dc(fh.read())
+        if _s.unpack_from("<I", payload, 0)[0] != 0x45634678:      # 'xFcE'
+            check(f"{name}: no I/O section (layout file)", not art.facts.get("io_events"))
+            continue
+        # The two section counts in the header are the authority; a decoder that walks blocks
+        # by any other rule drifts and silently loses or invents events.
+        declared = sum(_s.unpack_from("<2I", payload, 8))
+        check(f"{name}: {declared:,} events, matching header 8+12",
+              art.facts.get("io_events") == declared, art.facts.get("io_events"))
+        # Every event names a file. Anything less means the record layout is misaligned.
+        unresolved = [p for p, _n, _b in art.io_by_path if p.startswith("<unresolved:")]
+        check(f"{name}: every event resolves to a name", not unresolved, unresolved[:3])
+        check(f"{name}: clock runs forward",
+              (art.facts.get("io_first_tick") or 0) < (art.facts.get("io_last_tick") or 0))
+
     print("\ncrafted name tables cannot hang the parser:")
     from prefetch_core.artifacts import _resolve_paths
     NO_PARENT = 0xFFFFFFFF

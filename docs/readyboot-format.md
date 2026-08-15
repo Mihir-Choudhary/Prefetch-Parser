@@ -154,19 +154,86 @@ Combined with the mtimes already recorded (five traces spanning 2026-07-18 to 20
 which files the system touched during boot** — evidence that exists nowhere in `.pf` and that
 PECmd does not read.
 
-Standing caveat, unchanged: this is still an **access** artifact, not an execution record, and
-the entries carry no per-file timestamps. The trace's own mtime dates the boot; it does not
-date any individual file access within it.
+It is still an **access** artifact, not an execution record: a path here means the boot read
+that file, never that a program ran.
+
+The "no per-entry timestamps" caveat recorded earlier is **wrong** and is corrected here. Every
+I/O event carries a monotonic tick, so events are ordered and their relative timing is known.
+What is not known is the tick's *unit*, so the tool reports raw ticks and converts nothing. The
+trace's mtime dates the boot in absolute terms; the ticks position events within it.
+
+## The I/O trace — the rest of the payload
+
+Everything in an `xFcE` payload before the name table (about 7 MB of `Trace2.fx`'s 7.8 MB) is
+the trace itself: **one 40-byte record per read the system performed while booting.**
+
+The record size was found by autocorrelation — stride 40 scores 0.79 against a 0.37 baseline,
+with clean harmonics at 80 and 120, uniformly across the whole region.
+
+```
+u32  flags                    7 distinct values
+u32  flags                    almost always 0
+u64  byte offset of the read  within the file; a volume offset when unattributed
+u32  name-table offset  <-- WHICH FILE
+u32  unidentified             constant 402 in every record seen
+u32  I/O size in bytes        4096, 65536, 1048576, …
+u32  timestamp                monotonic tick since boot
+u32  sequence within block
+u32  unidentified
+```
+
+Records are grouped into **blocks of 1024** followed by an 8-byte trailer. The trailer looks
+like a live count and is not one — it reads `0` on a block holding 63 real records — so the
+authority is the pair of counts in the header at offsets 8 and 12. They are two consecutive
+sections in the same block stream, and they sum **exactly** to the number of non-empty records:
+`105,535 + 67,874 = 173,409` on `Trace2.fx`. Section 1 ends mid-block (block 103, record 63),
+its block is zero-filled from there, and section 2 begins at the next block.
+
+Identifying the file field took a phase correction. Read at the wrong alignment, every column
+scores 22–27% against the name table — high enough to look meaningful, uniform enough to be
+meaningless. Aligned correctly, one column is unambiguous:
+
+| Field | Valid name-table offsets | Distinct values |
+|---|---|---|
+| f2 | 0.0% | 81,638 |
+| **f4** | **100.0%** | **4,464** |
+| f7 | 0.0% | 102,032 |
+| f9 | 15.2% | 4,060 |
+
+**Every event in every trace resolves to a named file** — verified as a test assertion, not a
+spot check.
+
+### What it yields
+
+| File | I/O events | Bytes read | Distinct files |
+|---|---|---|---|
+| `Trace2.fx` | 173,409 | 8,161 MB | 4,485 |
+| `Trace3.fx` | 228,938 | 8,903 MB | 7,152 |
+| `Trace4.fx` | 220,729 | 7,544 MB | 6,249 |
+| `Trace5.fx` | 176,095 | 8,039 MB | 4,462 |
+| `Trace6.fx` | 222,611 | 6,971 MB | 5,544 |
+
+Heaviest reads from one real boot:
+
+```
+  394 reads  784.4 MB  \Device\HarddiskVolume3\$WinREAgent\Scratch\update.wim
+  384 reads  576.1 MB  \Device\HarddiskVolume3\Windows\System32\config\SOFTWARE
+  150 reads  268.1 MB  …\Windows Defender\Definition Updates\{…}\mpasbase.vdm
+    6 reads  153.9 MB  \Device\HarddiskVolume3\Windows\System32\DriverStore\...\amdkmdag.sys
+```
+
+About 31% of events resolve to `FI_UNKNOWN`, a real entry in the name table. These are reads
+the tracer could not attribute to a file — dominated by early boot, before the filesystem is
+available — and their offset field is a volume offset rather than a file offset.
 
 ## Still open
 
 - The 4-byte inter-chunk field. High entropy, no relation to length or count. **Unidentified** —
-  a checksum is a guess, not a finding. It is not needed to decode the file.
-- The region of the `xFcE` payload *before* the name table (about 7 MB of the 7.8 MB in
-  `Trace2.fx`). This is the per-access data — presumably which file was touched, when, and how
-  much was read — and it is not mapped. Recovering it would turn the path list into a timeline.
-- The two remaining `xFcE` header dwords at offsets 8 and 12 (105,535 and 67,874 in
-  `Trace2.fx`).
+  a checksum is a guess, not a finding, and it is not needed to decode the file.
+- Three record fields: the two flag words and the last dword. The flags take 7 and 2 distinct
+  values; the constant `402` never varies in any record on any trace.
+- The tick unit. It is monotonic and matches the shape of the `PfPre` clock, but nothing in the
+  file states its unit, so the tool reports raw ticks and does not convert to seconds.
 
-What is **not** open any more: the compression, the chunk chain, the name table, and the path
-tree. Those are decoded and verified.
+What is **not** open any more: the compression, the chunk chain, the name table, the path tree,
+and the I/O trace itself.

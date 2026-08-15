@@ -294,9 +294,25 @@ Every link resolves on every file — 8,927 to 20,179 paths each, none dropped:
 ```
 
 They use the same `\Device\HarddiskVolumeN\` notation as `.pf`, so the volume correlation
-applies unchanged. Same standing caveat as the rest of this section: **access, not execution**,
-and no per-entry timestamps — the trace's mtime dates the boot, nothing dates an entry inside
-it.
+applies unchanged.
+
+The rest of the payload is the **trace itself** — one 40-byte record per read, carrying the
+file, the byte offset, the I/O size and a monotonic tick. A single boot yields 173,000–229,000
+events covering 7–9 GB of reads across 4,400–7,200 files, and **every event resolves to a named
+file**. The tool reports per-file totals, heaviest first:
+
+```
+  394 reads  784.4 MB  \Device\HarddiskVolume3\$WinREAgent\Scratch\update.wim
+  384 reads  576.1 MB  \Device\HarddiskVolume3\Windows\System32\config\SOFTWARE
+  150 reads  268.1 MB  ...\Windows Defender\Definition Updates\{...}\mpasbase.vdm
+```
+
+About 31% of events belong to `FI_UNKNOWN` — reads the tracer could not attribute to a file,
+mostly from early boot before the filesystem is up.
+
+Standing caveat: this is **access, not execution**. A path here means the boot read that file,
+never that a program ran. Events are ordered and relatively timed by their ticks, but the tick
+unit is unknown, so no wall-clock time is claimed for an individual event.
 
 ---
 
@@ -451,17 +467,16 @@ multiple locations. The widely repeated "several hashes ⇒ ran from several pla
 heuristic false-positives on `svchost`, `runtimebroker`, `dllhost` and `msedge` on any normal
 system. Compare resolved **paths** instead.
 
-### ReadyBoot per-access data is not decoded
+### ReadyBoot: three fields and the tick unit
 
-The container, the chunk chain, the name table and the path tree are all decoded, and every
-path resolves (see [ReadyBoot](#readyboot)). What is *not* decoded is the bulk of the payload
-that precedes the name table — roughly 7 MB of `Trace2.fx`'s 7.8 MB. That region should hold
-the per-access records (which file, when, how much was read); mapping it would turn the path
-list into a boot timeline. Until then ReadyBoot tells you **which** files a boot touched, not
-in what order or when.
+The container, chunk chain, name table, path tree and I/O trace are all decoded (see
+[ReadyBoot](#readyboot)); every event resolves to a named file. What remains unidentified is
+small: two flag words and the last dword of each I/O record, a constant `402` that never
+varies, and the 4-byte field between chunks.
 
-The 4-byte field between chunks is also unidentified — high entropy, no relation to length or
-count. It is not needed to decode the file.
+The event **tick unit** is also unknown. Ticks are monotonic, so ordering and relative timing
+are sound, but nothing in the file states whether a tick is a millisecond or something else —
+so the tool reports raw ticks and converts nothing.
 
 ### `PfPre_*.mkd` semantics unknown
 

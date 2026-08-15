@@ -407,6 +407,14 @@ def cmd_artifacts(args):
                 print(f"        {p}")
             if not args.paths and len(a.paths) > 3:
                 print(f"        … {len(a.paths) - 3} more (--paths to list all)")
+        if a.io_by_path:
+            # Heaviest first: on a boot trace the top few reads are the whole story, and the
+            # tail is thousands of 4 KB reads nobody scrolls through.
+            print(f"    {'heaviest reads':22} {len(a.io_by_path)} files")
+            for path, count, nbytes in (a.io_by_path if args.paths else a.io_by_path[:5]):
+                print(f"        {nbytes / 1048576:9,.1f} MB in {count:>6,} reads  {path}")
+            if not args.paths and len(a.io_by_path) > 5:
+                print(f"        … {len(a.io_by_path) - 5} more (--paths to list all)")
         for problem in a.problems:
             print(f"    ! {problem}")
     # These are access/priority artifacts. Saying so once, plainly, is cheaper than an analyst

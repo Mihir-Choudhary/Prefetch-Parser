@@ -42,6 +42,8 @@ class Artifact:
     paths: list[str] = field(default_factory=list)
     facts: dict[str, object] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
+    # ReadyBoot only: (path, read count, bytes read) per file, heaviest first.
+    io_by_path: list[tuple[str, int, int]] = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -259,7 +261,55 @@ def parse_readyboot(path: str, data: bytes) -> Artifact:
     if broken:
         art.problems.append(f"{broken} of {len(records)} records have an unresolvable parent "
                             "link; those paths were dropped rather than guessed")
+
+    # The I/O trace. Summarised rather than stored event by event: a single trace holds ~175,000
+    # reads, and an analyst wants "what was read, how much, when" long before they want the
+    # individual events. iter_io_events() is public for anyone who does.
+    by_name: dict[int, list[int]] = {}
+    events = bytes_read = 0
+    first = last = None
+    for when, size, _offset, name in iter_io_events(payload, bounds[0]):
+        events += 1
+        bytes_read += size
+        if first is None:
+            first = when
+        last = when
+        slot = by_name.get(name)
+        if slot is None:
+            by_name[name] = [1, size]
+        else:
+            slot[0] += 1
+            slot[1] += size
+    if not events:
+        return art
+
+    art.facts["io_events"] = events
+    art.facts["io_bytes_read"] = bytes_read
+    art.facts["io_files_touched"] = len(by_name)
+    art.facts["io_first_tick"] = first
+    art.facts["io_last_tick"] = last
+    unresolved = sum(n for off, (n, _b) in by_name.items() if off not in records)
+    art.facts["io_unattributed"] = unresolved
+    art.io_by_path = sorted(
+        ((_path_for(records, off), n, b) for off, (n, b) in by_name.items()),
+        key=lambda row: row[2], reverse=True)
     return art
+
+
+def _path_for(records: dict[int, tuple[str, int]], offset: int) -> str:
+    """Whole path for one name-table offset, or a marker when the link cannot be followed."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    cursor = offset
+    while cursor != _NO_PARENT and cursor in records and cursor not in seen \
+            and len(parts) < _MAX_DEPTH:
+        seen.add(cursor)
+        name, parent = records[cursor]
+        parts.append(name)
+        cursor = parent
+    if not parts:
+        return f"<unresolved:{offset}>"
+    return "\\" + "\\".join(reversed(parts))
 
 
 # The decompressed payload ends (or, for rblayout, begins) with a **name table**: a directory
@@ -325,6 +375,61 @@ def _read_table(payload: bytes, start: int, end: int) -> dict[int, tuple[str, in
         records[pos - start] = (name, parent)
         pos = stop
     return records
+
+
+# The `xFcE` payload in front of the name table is the I/O trace itself: one 40-byte record per
+# read the system performed while booting.
+#
+#     u32  flags                       7 distinct values
+#     u32  flags                       almost always 0
+#     u64  byte offset of the read     within the file, or on the volume when unattributed
+#     u32  name-table offset  <-- WHICH FILE. Resolves for 100% of records on every trace.
+#     u32  unidentified                constant 402 across every record seen
+#     u32  I/O size in bytes           4096, 65536, 1048576, ...
+#     u32  timestamp                   monotonic tick since boot
+#     u32  sequence within the block
+#     u32  unidentified
+#
+# Records are grouped into blocks of 1024 followed by an 8-byte trailer. The trailer is NOT a
+# usable live count - it reads 0 on a block holding 63 real records - so the authority for how
+# many records exist is the pair of counts in the `xFcE` header at offsets 8 and 12. They are
+# two consecutive sections laid out in the same blocks, and they sum exactly to the number of
+# non-empty records (105,535 + 67,874 = 173,409 on Trace2.fx). A section that does not fill its
+# last block leaves the remainder zeroed and the next section starts at the next block.
+_IO_RECORD = 40
+_IO_PER_BLOCK = 1024
+_IO_BLOCK = _IO_PER_BLOCK * _IO_RECORD + 8
+_IO_HEADER_END = 46          # 'xFcE' header, then a length-prefixed 'DMIO:ID:' + disk GUID
+
+# One trace holds ~175k events; a crafted header could claim far more. This bounds the work
+# without ever firing on real evidence.
+_MAX_IO_EVENTS = 4_000_000
+
+
+def iter_io_events(payload: bytes, table_start: int):
+    """Yield (timestamp, size, offset, name_offset) for each recorded read, in file order.
+
+    Only the `xFcE` traces carry this; `iLdR` (rblayout) is a layout list with no I/O section.
+    """
+    if len(payload) < 20 or struct.unpack_from("<I", payload, 0)[0] != _XFCE_MAGIC:
+        return
+    sections = struct.unpack_from("<2I", payload, 8)
+    if sum(sections) > _MAX_IO_EVENTS:
+        return
+    block = 0
+    for count in sections:
+        emitted = 0
+        while emitted < count:
+            base = _IO_HEADER_END + block * _IO_BLOCK
+            if base + _IO_BLOCK > table_start:
+                return
+            take = min(_IO_PER_BLOCK, count - emitted)
+            for i in range(take):
+                _f0, _f1, lo, hi, name, _c, size, when, _seq, _x = struct.unpack_from(
+                    "<10I", payload, base + i * _IO_RECORD)
+                yield when, size, (hi << 32) | lo, name
+            emitted += take
+            block += 1
 
 
 def _resolve_paths(records: dict[int, tuple[str, int]]) -> tuple[list[str], int]:

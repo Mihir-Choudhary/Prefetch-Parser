@@ -12,7 +12,8 @@ and macOS — it does not need Windows to read Windows 10/11 prefetch.
 - **Nothing skipped** — loaded files with MFT references, every volume, directories, trace
   chains, and a row for files that fail to parse
 - **The rest of the Prefetch folder too** — `Layout.ini`, SuperFetch databases, and Windows 11
-  **ReadyBoot boot traces, decompressed** ([format worked out here](docs/readyboot-format.md))
+  **ReadyBoot boot traces**: an undocumented format reverse-engineered for this tool, giving
+  every file a boot read and how much of it ([how](docs/readyboot-format.md))
 - **Alternate data streams** — recovers prefetch hidden in an ADS, without pretending the
   carrier's timestamps are its own
 - **GUI** with Excel-style per-column filters, tagging and export; **CLI** for scripting
