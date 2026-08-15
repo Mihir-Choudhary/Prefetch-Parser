@@ -400,6 +400,20 @@ spreadsheet:
 
 The SQLite store is never sanitised — it is the source of truth.
 
+### What the exports do *not* contain
+
+`--db` and `--csv` carry **`.pf` records only**. The other Prefetch-folder artifacts —
+`Layout.ini`, the SuperFetch databases and the ReadyBoot traces, including ReadyBoot's per-file
+I/O totals — are reported by `pfcli artifacts` and the GUI's *Folder artifacts* window, and are
+not written to either export.
+
+That is deliberate: they are a different kind of evidence (access, not execution) with a
+different shape, and merging them into a per-execution table would invite exactly the
+misreading the whole artifact section is written to prevent. It does mean the fidelity
+guarantee described under [Testing](#testing) — every value in CSV, SQLite, the grid and the
+detail panes matching the parsed record — is a statement about `.pf` records, not about
+artifacts.
+
 ### Differences from PECmd, deliberate
 
 | | PECmd | Here |

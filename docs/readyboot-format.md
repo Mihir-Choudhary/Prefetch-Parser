@@ -48,7 +48,7 @@ offset 0   u32   magic            0xE3426650  ('PfB\xe3')
 offset 4   u32   uncompressed size    total across all chunks
 offset 8   u32   length of chunk 0's compressed data
 offset 12        chunk 0 compressed data
-                 u32  unknown (high-entropy; consistent with a checksum)
+                 u32  unidentified (high entropy; not needed to decode)
                  u32  length of chunk 1's compressed data
                  chunk 1 compressed data
                  u32  unknown

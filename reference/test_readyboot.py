@@ -151,6 +151,34 @@ def main():
         check(f"{name}: clock runs forward",
               (art.facts.get("io_first_tick") or 0) < (art.facts.get("io_last_tick") or 0))
 
+    print("\nthe GUI's folder-artifacts window shows the I/O trace, not just the facts:")
+    # The recurring failure mode in this project is a correct value that never reaches a
+    # surface. io_by_path is a new field on Artifact; the CLI prints it, and this asserts the
+    # GUI does too rather than silently dropping it.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        print("  (PySide6 not installed; skipped)")
+    else:
+        app = QApplication.instance() or QApplication([])
+        import pfgui.__main__ as gui
+        window = gui.MainWindow()
+        window._load_artifacts([corpus.WIN11])
+        text = window.detail_artifacts.toPlainText()
+        for needle in ("heaviest reads", "io_events", "io_seconds_assuming_us"):
+            check(f"folder-artifacts text includes {needle!r}", needle in text)
+        check("a real read total is rendered", " MB in " in text)
+        app.processEvents()
+
+    print("\nscan_folder reports progress, so a slow folder cannot look like a hang:")
+    from prefetch_core.artifacts import scan_folder
+    seen = []
+    scan_folder(os.path.dirname(files[0]), progress=seen.append)
+    check("progress callback fired per file", len(seen) >= len(files), len(seen))
+    check("scan_folder still works without a callback",
+          len(scan_folder(os.path.dirname(files[0]))) == len(files))
+
     print("\ncrafted name tables cannot hang the parser:")
     from prefetch_core.artifacts import _resolve_paths
     NO_PARENT = 0xFFFFFFFF

@@ -401,10 +401,25 @@ class MainWindow(QMainWindow):
     def _load_artifacts(self, paths):
         from prefetch_core.artifacts import scan_folder
 
+        # A ReadyBoot trace costs over a second to decompress and resolve, so a folder with
+        # five of them blocks for several seconds here. Without this the window freezes with no
+        # explanation right after the .pf progress dialog closes, which reads as a crash.
+        busy = QProgressDialog("Reading folder artifacts…", None, 0, 0, self)
+        busy.setWindowTitle("Loading")
+        busy.setWindowModality(Qt.WindowModal)
+        busy.setMinimumDuration(300)          # stays invisible for a folder without ReadyBoot
+
+        def tick(name):
+            busy.setLabelText(f"Reading folder artifacts…\n{name}")
+            QApplication.processEvents()
+
         found = []
-        for p in paths:
-            if os.path.isdir(p):
-                found += scan_folder(p)
+        try:
+            for p in paths:
+                if os.path.isdir(p):
+                    found += scan_folder(p, progress=tick)
+        finally:
+            busy.close()
         if not found:
             self.detail_artifacts.setPlainText("No non-.pf artifacts found in the folder(s).")
             return
@@ -419,6 +434,14 @@ class MainWindow(QMainWindow):
                 block += [f"        {p}" for p in a.paths[:200]]
                 if len(a.paths) > 200:
                     block.append(f"        … {len(a.paths) - 200} more")
+            if a.io_by_path:
+                # ReadyBoot's per-file read totals. Capped like the path list: a trace touches
+                # thousands of files and the heaviest few are what an analyst reads.
+                block.append(f"    {'heaviest reads':22} {len(a.io_by_path)} files")
+                block += [f"        {n / 1048576:9,.1f} MB in {c:>6,} reads  {p}"
+                          for p, c, n in a.io_by_path[:200]]
+                if len(a.io_by_path) > 200:
+                    block.append(f"        … {len(a.io_by_path) - 200} more")
             block += [f"    ! {p}" for p in a.problems]
             blocks.append("\n".join(block))
         self.detail_artifacts.setPlainText("\n\n".join(blocks))

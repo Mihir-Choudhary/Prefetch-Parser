@@ -517,15 +517,22 @@ def parse_artifact(path: str) -> Artifact | None:
     return art
 
 
-def scan_folder(root: str) -> list[Artifact]:
+def scan_folder(root: str, progress=None) -> list[Artifact]:
     """Walk a Prefetch folder for non-.pf artifacts.
 
     Recurses: ReadyBoot lives in a `ReadyBoot/` subdirectory, and its absence is normal (Win10
     has none), so neither recursion nor a missing subtree is an error.
+
+    `progress(name)` is called before each file is parsed. A single ReadyBoot trace takes over
+    a second - decompressing 8 MB and resolving ~200,000 I/O events - so a folder with five of
+    them blocks for several seconds. A caller with a UI needs to be able to say so rather than
+    appear to hang.
     """
     found = []
     for dirpath, _dirs, names in os.walk(root):
         for n in sorted(names):
+            if progress is not None:
+                progress(n)
             art = parse_artifact(os.path.join(dirpath, n))
             if art is not None:
                 found.append(art)
