@@ -26,6 +26,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import corpus
+from prefetch_core.artifacts import Artifact
 from prefetch_core.xpress import PFB_MAGIC, InvalidCompressedData, decompress_pfb
 
 CHUNK = 65536
@@ -166,7 +167,10 @@ def main():
         window = gui.MainWindow()
         window._load_artifacts([corpus.WIN11])
         text = window.detail_artifacts.toPlainText()
-        for needle in ("heaviest reads", "io_events", "io_seconds_assuming_us"):
+        for needle in ("heaviest reads", "io_events", "io_seconds_assuming_us",
+                       # The CLI prints this too; both surfaces must agree about what the
+                       # tool established, or they answer the same question differently.
+                       "Volume identity", "C: = \\Device\\HarddiskVolume3"):
             check(f"folder-artifacts text includes {needle!r}", needle in text)
         check("a real read total is rendered", " MB in " in text)
         app.processEvents()
@@ -179,10 +183,88 @@ def main():
     check("scan_folder still works without a callback",
           len(scan_folder(os.path.dirname(files[0]))) == len(files))
 
+    print("\nbugs found in the 2026-08-15 audit stay fixed:")
+    import struct as _st
+    from prefetch_core.artifacts import io_array_start, iter_io_events
+    from prefetch_core.xpress import decompress_pfb as _dcp
+    trace_file = next(p for p in files if os.path.basename(p).startswith("Trace"))
+    with open(trace_file, "rb") as fh:
+        payload = _dcp(fh.read())
+    table_start = len(payload) - _st.unpack_from("<I", payload, 16)[0]
+
+    # 1. The two sections are CONCURRENT in time, not sequential: section 2 begins before
+    #    section 1 ends. first/last must therefore be min/max, not first-seen/last-seen.
+    sec1, sec2 = _st.unpack_from("<2I", payload, 8)
+    ticks = [w for w, _s, _o, _n in iter_io_events(payload, table_start)]
+    check("section 2 starts before section 1 ends (the reason min/max is required)",
+          ticks[sec1] < ticks[sec1 - 1], f"{ticks[sec1]} vs {ticks[sec1 - 1]}")
+    art = parse_artifact(trace_file)
+    check("io_first_tick is the minimum, not the first seen",
+          art.facts["io_first_tick"] == min(ticks), art.facts["io_first_tick"])
+    check("io_last_tick is the maximum, not the last seen",
+          art.facts["io_last_tick"] == max(ticks), art.facts["io_last_tick"])
+    check("span is never negative", art.facts["io_span_ticks"] >= 0)
+
+    # 2. The I/O array start is derived from the header's length-prefixed DMIO string. Hardcoding
+    #    46 misaligns the whole array on any machine writing a different-length string, and a
+    #    misaligned array decodes into plausible nonsense rather than failing.
+    check("I/O array start is derived from the header", io_array_start(payload) == 46,
+          io_array_start(payload))
+    shifted = bytearray(payload)
+    _st.pack_into("<H", shifted, 20, 40)
+    check("a different DMIO length moves the derived start",
+          io_array_start(bytes(shifted)) == 62, io_array_start(bytes(shifted)))
+
+    # 3. A malformed I/O header must be REPORTED. Yielding nothing is indistinguishable from a
+    #    trace that genuinely recorded nothing, which limits.py forbids.
+    for label, mutate in (
+        ("absurd event counts", lambda b: _st.pack_into("<2I", b, 8, 10**9, 10**9)),
+    ):
+        bad = bytearray(payload)
+        mutate(bad)
+        try:
+            list(iter_io_events(bytes(bad), table_start))
+            check(f"{label} is reported, not skipped", False, "yielded silently")
+        except (InvalidCompressedData, struct.error):
+            check(f"{label} is reported, not skipped", True)
+    try:
+        list(iter_io_events(payload, 100))       # name table before the array can fit
+        check("truncated I/O region is reported, not skipped", False, "yielded silently")
+    except (InvalidCompressedData, struct.error):
+        check("truncated I/O region is reported, not skipped", True)
+
+    # 4. FI_UNKNOWN is a ROOT record, so the marker path is exactly "\FI_UNKNOWN". A suffix
+    #    test also swallows a real file called MY_FI_UNKNOWN and inflates the count.
+    inflating = [p for p, _n, _b in art.io_by_path
+                 if p.endswith("FI_UNKNOWN") and p != "\\FI_UNKNOWN"]
+    exact = next((n for p, n, _b in art.io_by_path if p == "\\FI_UNKNOWN"), 0)
+    check("unattributed counts only the exact marker",
+          art.facts["io_unattributed"] == exact, art.facts["io_unattributed"])
+    check("no non-marker path is being counted as unattributed", not inflating, inflating[:3])
+
     print("\nvolume identity is correlated across artifacts, and withheld when unsupported:")
     from prefetch_core.artifacts import correlate_volumes, scan_folder
     rows = correlate_volumes(scan_folder(corpus.WIN11))
     check("one drive letter established", len(rows) == 1, len(rows))
+
+    # 5. With two letters mapped and one volume on record, there is nothing to say which letter
+    #    the serial belongs to. Attaching it to both asserts C: and D: are the same volume.
+    def _art(kind, paths, facts=None):
+        a = Artifact("synthetic", kind)
+        a.paths = paths
+        a.facts = facts or {}
+        return a
+    two = correlate_volumes([
+        _art("readyboot", [f"\\Device\\HarddiskVolume3\\WINDOWS\\{n}.DLL" for n in "ABC"]
+             + [f"\\Device\\HarddiskVolume9\\DATA\\{n}.DAT" for n in "XYZ"]),
+        _art("layout", [f"C:\\WINDOWS\\{n}.DLL" for n in "ABC"]
+             + [f"D:\\DATA\\{n}.DAT" for n in "XYZ"]),
+        _art("superfetch", [], {"volumes": "\\VOLUME{01d6d2b931a49a11-cc31b5d5}"}),
+    ])
+    check("two letters both map", len(two) == 2, len(two))
+    check("one serial is NOT stamped onto two different letters",
+          not any("volume_serial" in r for r in two),
+          [r.get("volume_serial") for r in two])
     if rows:
         row = rows[0]
         check("C: maps to HarddiskVolume3",

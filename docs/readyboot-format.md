@@ -184,10 +184,17 @@ u32  unidentified
 
 Records are grouped into **blocks of 1024** followed by an 8-byte trailer. The trailer looks
 like a live count and is not one — it reads `0` on a block holding 63 real records — so the
-authority is the pair of counts in the header at offsets 8 and 12. They are two consecutive
-sections in the same block stream, and they sum **exactly** to the number of non-empty records:
-`105,535 + 67,874 = 173,409` on `Trace2.fx`. Section 1 ends mid-block (block 103, record 63),
-its block is zero-filled from there, and section 2 begins at the next block.
+authority is the pair of counts in the header at offsets 8 and 12. They are two sections laid
+out consecutively in the same block stream, and they sum **exactly** to the number of non-empty
+records: `105,535 + 67,874 = 173,409` on `Trace2.fx`. Section 1 ends mid-block (block 103,
+record 63), its block is zero-filled from there, and section 2 begins at the next block.
+
+**The two sections are consecutive in the file but CONCURRENT in time.** On every trace in the
+corpus section 2's first tick is *earlier* than section 1's last tick, and both sections end on
+the same tick — they are two parallel recordings of the same boot, not one after the other. A
+reader that treats the events as a single monotonic sequence and takes the first and last record
+as the time bounds gets the right answer on this corpus by luck, and a wrong or negative span
+elsewhere. Use min/max over all events.
 
 Identifying the file field took a phase correction. Read at the wrong alignment, every column
 scores 22–27% against the name table — high enough to look meaningful, uniform enough to be

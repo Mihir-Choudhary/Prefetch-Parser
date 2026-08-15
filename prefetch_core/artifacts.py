@@ -268,18 +268,26 @@ def parse_readyboot(path: str, data: bytes) -> Artifact:
     by_name: dict[int, list[int]] = {}
     events = bytes_read = 0
     first = last = None
-    for when, size, _offset, name in iter_io_events(payload, bounds[0]):
-        events += 1
-        bytes_read += size
-        if first is None:
-            first = when
-        last = when
-        slot = by_name.get(name)
-        if slot is None:
-            by_name[name] = [1, size]
-        else:
-            slot[0] += 1
-            slot[1] += size
+    try:
+        for when, size, _offset, name in iter_io_events(payload, bounds[0]):
+            events += 1
+            bytes_read += size
+            # min/max, NOT first-seen/last-seen. The two sections are consecutive in the file
+            # but CONCURRENT in time - section 2 starts before section 1 ends on every trace in
+            # the corpus - so the last record read is not the latest event and the first is not
+            # the earliest. Taking them in iteration order happens to be right on this corpus
+            # and would silently produce a wrong (or negative) span elsewhere.
+            first = when if first is None else min(first, when)
+            last = when if last is None else max(last, when)
+            slot = by_name.get(name)
+            if slot is None:
+                by_name[name] = [1, size]
+            else:
+                slot[0] += 1
+                slot[1] += size
+    except (InvalidCompressedData, struct.error) as exc:
+        art.problems.append(f"I/O trace not read: {exc}")
+        return art
     if not events:
         return art
 
@@ -302,8 +310,13 @@ def parse_readyboot(path: str, data: bytes) -> Artifact:
     # perfectly, to a marker name the tracer itself writes - and they dominate early boot,
     # before the filesystem is available. Counting unresolvable offsets instead would report 0
     # and tell an analyst nothing.
+    #
+    # Exact match, not endswith: the marker is a ROOT record, so its whole path is
+    # "\FI_UNKNOWN". A suffix test also swallows a real file named MY_FI_UNKNOWN, or any file
+    # called FI_UNKNOWN sitting on a device, and inflates the unattributed count with reads
+    # that were in fact attributed.
     art.facts["io_unattributed"] = sum(
-        n for path, n, _b in art.io_by_path if path.rstrip("\\").endswith("FI_UNKNOWN"))
+        n for path, n, _b in art.io_by_path if path == _UNATTRIBUTED)
     return art
 
 
@@ -410,30 +423,59 @@ def _read_table(payload: bytes, start: int, end: int) -> dict[int, tuple[str, in
 _IO_RECORD = 40
 _IO_PER_BLOCK = 1024
 _IO_BLOCK = _IO_PER_BLOCK * _IO_RECORD + 8
-_IO_HEADER_END = 46          # 'xFcE' header, then a length-prefixed 'DMIO:ID:' + disk GUID
+# The tracer's own marker for a read it could not attribute to a file. A root record, so its
+# whole path is exactly this.
+_UNATTRIBUTED = "\\FI_UNKNOWN"
 
 # One trace holds ~175k events; a crafted header could claim far more. This bounds the work
 # without ever firing on real evidence.
 _MAX_IO_EVENTS = 4_000_000
 
 
+def io_array_start(payload: bytes) -> int | None:
+    """Byte offset of the first I/O record, derived from the header rather than assumed.
+
+    The `xFcE` header ends with a length-prefixed `DMIO:ID:` + disk GUID: a u16 count at offset
+    20, then that many bytes from offset 22. Hardcoding the resulting 46 would misalign the
+    entire record array on any machine that writes a different-length string, and a misaligned
+    array does not fail - it decodes into plausible nonsense.
+    """
+    if len(payload) < 22:
+        return None
+    start = 22 + struct.unpack_from("<H", payload, 20)[0]
+    if start > len(payload):
+        return None
+    return start
+
+
 def iter_io_events(payload: bytes, table_start: int):
     """Yield (timestamp, size, offset, name_offset) for each recorded read, in file order.
 
     Only the `xFcE` traces carry this; `iLdR` (rblayout) is a layout list with no I/O section.
+
+    Raises InvalidCompressedData when the header describes an array that cannot be read, so the
+    caller can report it. Yielding nothing on a malformed trace is indistinguishable from a
+    trace that genuinely recorded nothing, and this parser must never make that ambiguous.
     """
     if len(payload) < 20 or struct.unpack_from("<I", payload, 0)[0] != _XFCE_MAGIC:
         return
     sections = struct.unpack_from("<2I", payload, 8)
     if sum(sections) > _MAX_IO_EVENTS:
-        return
+        raise InvalidCompressedData(
+            f"header claims {sum(sections):,} I/O events, above the "
+            f"{_MAX_IO_EVENTS:,} ceiling")
+    start = io_array_start(payload)
+    if start is None:
+        raise InvalidCompressedData("header is truncated before the I/O array")
     block = 0
     for count in sections:
         emitted = 0
         while emitted < count:
-            base = _IO_HEADER_END + block * _IO_BLOCK
+            base = start + block * _IO_BLOCK
             if base + _IO_BLOCK > table_start:
-                return
+                raise InvalidCompressedData(
+                    f"I/O array runs past the name table after {block} blocks; "
+                    f"the header's event counts and the file do not agree")
             take = min(_IO_PER_BLOCK, count - emitted)
             for i in range(take):
                 _f0, _f1, lo, hi, name, _c, size, when, _seq, _x = struct.unpack_from(
@@ -619,18 +661,20 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
         others = [s for dev, s in scores.items() if dev != best]
         if scores[best] < _VOL_MATCH_MIN or any(s > _VOL_REJECT_MAX for s in others):
             continue
-        row = {
+        rows.append({
             "drive_letter": f"{letter}:",
             "device": f"\\Device\\{best}",
             "shared_paths": len(letter_paths & by_device[best]),
             "match": round(scores[best] * 100, 1),
             "next_best": round(max(others) * 100, 1) if others else 0.0,
             "basis": "ReadyBoot paths matched against Layout.ini (inferred)",
-        }
-        # Only bind a serial when the folder offers exactly one, otherwise there is nothing to
-        # say which volume it belongs to.
-        if len(volumes) == 1:
-            row["volume_serial"] = volumes[0][0]
-            row["volume_created"] = volumes[0][1]
-        rows.append(row)
+        })
+
+    # Bind the serial only when there is exactly one volume AND exactly one mapped letter.
+    # With one volume and two letters there is nothing to say which letter it belongs to, and
+    # attaching it to both states as fact that C: and D: are the same volume - a claim that is
+    # necessarily false and would go into a report unchallenged.
+    if len(volumes) == 1 and len(rows) == 1:
+        rows[0]["volume_serial"] = volumes[0][0]
+        rows[0]["volume_created"] = volumes[0][1]
     return rows

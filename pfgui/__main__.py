@@ -425,6 +425,23 @@ class MainWindow(QMainWindow):
             return
         blocks = ["These record file ACCESS and prefetcher priority, not execution. "
                   "They carry no run times.\n"]
+        # The CLI reports this under `pfcli artifacts`; leaving it out here meant the two
+        # surfaces of one tool answered "what volume is HarddiskVolume3?" differently.
+        from prefetch_core.artifacts import correlate_volumes
+        identities = correlate_volumes(found)
+        if identities:
+            ident = ["Volume identity (correlated across artifacts, inferred):"]
+            for row in identities:
+                ident.append(f"    {row['drive_letter']} = {row['device']}")
+                ident.append(f"        {row['shared_paths']:,} shared paths — "
+                             f"{row['match']}% of {row['drive_letter']} paths, "
+                             f"next best device {row['next_best']}%")
+                if row.get("volume_serial"):
+                    created = row.get("volume_created")
+                    ident.append(f"        serial {row['volume_serial']}" + (
+                        f", volume created {created:%Y-%m-%d %H:%M:%S} UTC" if created else ""))
+            ident.append("    Derived by correlation, not read from any file.")
+            blocks.append("\n".join(ident))
         for a in found:
             stamp = a.modified.strftime("%Y-%m-%d %H:%M") if a.modified else "-"
             block = [f"{a.name}   [{a.kind}]   {a.size:,} bytes   modified {stamp}"]
