@@ -36,7 +36,7 @@ how paths are resolved, ADS handling, cross-platform notes, the test suite, and 
 ## Status
 
 16 test suites, all passing. Verified against 690 real prefetch files across all five versions,
-against an independently written parser, and against PECmd's own output.
+and against an independently written parser built from the format specification.
 
 **Not yet run on Windows.** The Windows-specific code paths — the `ntdll` decompressor and ADS
 enumeration — are written and unit-tested but have never executed on Windows. See the
