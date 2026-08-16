@@ -157,8 +157,13 @@ class _Win32Backend:
 
     @staticmethod
     def read_stream(stream: Stream) -> bytes:
+        # Bounded read, one byte past the ceiling so the caller can tell "exactly at the limit"
+        # from "over it". The pre-read check uses the size FindFirstStreamW reported, which is
+        # metadata: it can be stale, and on a supplied image it can simply be false. An
+        # unbounded read here would let a stream that under-declares its size pull the whole
+        # file into memory regardless of the ceiling.
         with open(stream.open_path, "rb") as fh:
-            return fh.read()
+            return fh.read(MAX_STREAM_BYTES + 1)
 
 
 class NtfsImageBackend:
@@ -181,8 +186,10 @@ class NtfsImageBackend:
         return streams
 
     def read_stream(self, stream: Stream) -> bytes:
+        # Bounded for the same reason as the Win32 backend, and more sharply: `attr.size` comes
+        # from a raw image the analyst did not necessarily produce, so it is attacker-supplied.
         entry = self.fs.get(stream.carrier_path)
-        return entry.open(stream.short_name or None).read()
+        return entry.open(stream.short_name or None).read(MAX_STREAM_BYTES + 1)
 
 
 # Public alias: the image backend is the only way to use this off Windows, so it must be
@@ -252,6 +259,15 @@ def scan_file(path: str, backend=None, prefetch_folder: str | None = None) -> li
         except OSError as exc:
             findings.append(_unreadable(stream, primary_size, carrier_is_pf,
                                         prefetch_folder, carrier_times, str(exc)))
+            continue
+        # The check above trusted the enumerated size. This one trusts nothing: a stream that
+        # under-declares its size passes the first gate and is caught here, and the mismatch is
+        # itself worth reporting - metadata disagreeing with content is a finding, not noise.
+        if len(data) > MAX_STREAM_BYTES:
+            findings.append(_unreadable(
+                stream, primary_size, carrier_is_pf, prefetch_folder, carrier_times,
+                f"stream declared {stream.size:,} bytes but read past the "
+                f"{MAX_STREAM_BYTES:,} byte ceiling; not used"))
             continue
         if not looks_like_prefetch(data[:8]):
             continue

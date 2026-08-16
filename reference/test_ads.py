@@ -226,6 +226,26 @@ def main():
     check("the ceiling is explained",
           any("ceiling" in p for p in big[0].problems), True)
 
+    # The mirror case, which the size check alone cannot catch: a stream that UNDER-declares
+    # its size passes the pre-read gate and then hands back more than the ceiling. On a raw
+    # image the declared size is attacker-supplied, so it cannot be the only guard.
+    print("\na stream that under-declares its size is caught after the read:")
+
+    class UnderDeclared(FakeBackend):
+        def list_streams(self, path):
+            return [ads.Stream(path, "::$DATA", 0),
+                    ads.Stream(path, ":payload:$DATA", 10)]      # claims 10 bytes
+
+        def read_stream(self, stream):
+            return b"MAM\x84" + b"x" * ads.MAX_STREAM_BYTES      # delivers far more
+
+    lied = ads.scan_file("/case/BIG.TXT", UnderDeclared(huge), "/case")
+    check("a record is still produced", len(lied), 1)
+    check("the oversized read is refused, not parsed",
+          any("ceiling" in p for p in lied[0].problems), True)
+    check("the declared/actual mismatch is reported",
+          any("declared" in p for p in lied[0].problems), True)
+
     print("\ncreation time is read correctly per platform:")
     from prefetch_core.winpath import creation_time
     from unittest.mock import patch as _p
