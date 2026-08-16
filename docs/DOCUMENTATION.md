@@ -488,26 +488,38 @@ is a Linux build of the same spec, which settles the sizes:
 
 | Build | Size |
 |---|---|
-| GUI + CLI, `--onedir` (what the spec produces) | **179 MB** |
-| the same, zipped for distribution | 108 MB |
+| GUI + CLI, `--onedir` (what the spec produces) | **153 MB** |
+| the same, zipped for distribution | 89 MB |
 | CLI only, `--onedir` | **24 MB** |
 | CLI only, `--onefile` | **11 MB** |
 
 The split is entirely Qt. The library and CLI have no dependencies, which is why dropping the
 GUI takes 179 MB to 24 MB.
 
-About **70 MB of the GUI bundle is reachable-but-unused**, measured per inode (the tree
-hardlinks, so summing file sizes double-counts):
+The spec **excludes the Qt modules the GUI never imports**, which is where the 179 MB first
+measured became 153 MB. The GUI uses exactly three — `QtWidgets`, `QtCore`, `QtGui` — but the
+PySide6 hook collects the whole family, so Quick, Qml, Pdf, Network, OpenGL, Svg and
+VirtualKeyboard all rode along. Removing them takes out 15 files and adds none.
 
-| Component | Size | Why it is there |
+Two levers were needed, because they do different jobs: `excludes` stops the Python *bindings*
+being importable, while the shared libraries survive that (the hook adds them as data) and are
+filtered out of `binaries`/`datas` by name.
+
+What is left is genuinely required, and two items of it are **Linux-only**:
+
+| Component | Size | Status |
 |---|---|---|
-| `libicudata` | 30.6 MB | Qt internationalisation tables |
-| Qt Quick / Qml / Pdf / Network | 23.7 MB | never imported — the GUI uses only QtWidgets, QtCore, QtGui |
-| GTK theme | 8.3 MB | Linux platform integration; absent on a Windows build |
-| OpenSSL | 7.1 MB | pulled in by Qt Network |
+| `libicudata` | 30.6 MB | Qt6Core links it on Linux. Windows Qt6 uses the OS locale APIs and does not ship it |
+| `libQt6Gui` / `Widgets` / `Core` | 26.0 MB | required |
+| `libpython3.14` | 7.9 MB | required |
+| GTK theme | 7.1 MB | Linux platform integration; absent on Windows |
+| OpenSSL | 6.1 MB | pulled in by Python's own `hashlib`/`ssl`, **not** by Qt — excluding it would break the stdlib |
 
-Excluding those brings the GUI bundle to roughly **110 MB**, and a Windows build starts ~8 MB
-lower again because the GTK theme is not involved.
+So a **Windows** build should land near **115 MB** without any further work, simply because ICU
+and GTK are not part of it.
+
+`QtDBus` and ICU are deliberately *not* excluded: Linux platform integration reaches for DBus,
+and removing ICU stops Qt loading at all rather than saving 30 MB.
 
 Both frozen binaries were smoke-tested: the CLI parses a compressed Windows 11 prefetch file
 and resolves the executable path, and the GUI starts Qt successfully.
