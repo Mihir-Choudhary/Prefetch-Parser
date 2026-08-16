@@ -39,12 +39,25 @@ It can. ReadyBoot lists tens of thousands of files **per device**. `Layout.ini` 
 
 | Drive letter | Device | Shared paths | Match | Next-best device |
 |---|---|---|---|---|
-| `C:` | `\Device\HarddiskVolume3` | 4,239 | **99.3%** | **0.0%** |
+| `C:` | `\Device\HarddiskVolume3` | 4,238 | **99.3%** | **0.0%** |
 
-The discrimination is absolute, which is what separates a match from a correlation. The tool
-reports a letter only when one device explains most of a letter's paths *and* every other
-device explains essentially none; otherwise it reports nothing, because a wrong drive letter in
-a report is worse than a missing one.
+The discrimination is absolute, which is what separates a match from a correlation. A letter is
+claimed only when **all four** of these hold, because a percentage on its own can be confidently
+wrong:
+
+- one device explains at least half of the letter's paths, and
+- every other device explains essentially none (≤2%), and
+- at least 20 paths are actually shared — *one* shared path is also "100%", and
+- no other letter best-matches the same device — one device cannot be two letters, and with
+  only one device present there is no competing device for the second rule to catch.
+
+Paths that exist on every NTFS volume (`$Mft`, `$LogFile`, `System Volume Information`,
+`$Recycle.Bin`, anything beginning `$`) are excluded from both sides before scoring. Left in,
+a drive letter whose only known paths are filesystem metadata matches *any* device at 100% and
+gets mapped to the wrong one.
+
+If any of that fails the tool reports nothing, because a wrong drive letter in a report is worse
+than a missing one.
 
 `pfcli artifacts` prints this under **Volume identity**, labelled inferred.
 

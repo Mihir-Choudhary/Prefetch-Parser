@@ -598,11 +598,28 @@ def scan_folder(root: str, progress=None) -> list[Artifact]:
 # forensic report is worse than a missing one.
 _VOL_MATCH_MIN = 0.50
 _VOL_REJECT_MAX = 0.02
+# A percentage alone is not evidence: one shared path is "100%". The real match in the corpus
+# rests on 4,239 shared paths, so a floor this low cannot lose a genuine mapping while it
+# refuses letters backed by a handful of coincidences.
+_VOL_MIN_SHARED = 20
 _FILETIME_EPOCH = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+
+# NTFS puts these on *every* volume, so they say nothing about which volume this is. Left in,
+# a drive letter whose only known paths are `\$Mft` and `\System Volume Information` matches
+# any device at 100% and gets confidently mapped to the wrong one.
+_VOLUME_GENERIC = frozenset({
+    "SYSTEM VOLUME INFORMATION", "$RECYCLE.BIN", "RECYCLER", "$EXTEND",
+})
 
 
 def _normalise(path: str) -> str:
     return path.upper().rstrip("\\")
+
+
+def _discriminating(path: str) -> bool:
+    """False for paths that exist on every NTFS volume and so identify none of them."""
+    first = path.lstrip("\\").split("\\", 1)[0]
+    return bool(first) and not first.startswith("$") and first not in _VOLUME_GENERIC
 
 
 def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
@@ -622,7 +639,7 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
                 continue
             rest = path[len("\\Device\\"):]
             device, _, tail = rest.partition("\\")
-            if tail:
+            if tail and _discriminating(tail):
                 by_device.setdefault(device, set()).add(_normalise("\\" + tail))
 
     by_letter: dict[str, set[str]] = {}
@@ -630,7 +647,7 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
         if art.kind != "layout":
             continue
         for path in art.paths:
-            if len(path) > 2 and path[1] == ":":
+            if len(path) > 2 and path[1] == ":" and _discriminating(path[2:]):
                 by_letter.setdefault(path[0].upper(), set()).add(_normalise(path[2:]))
 
     # Serial and creation time come from the SuperFetch \VOLUME{creation-serial} names, which
@@ -659,16 +676,28 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
             continue
         best = max(scores, key=scores.get)
         others = [s for dev, s in scores.items() if dev != best]
+        shared = len(letter_paths & by_device[best])
         if scores[best] < _VOL_MATCH_MIN or any(s > _VOL_REJECT_MAX for s in others):
+            continue
+        if shared < _VOL_MIN_SHARED:
             continue
         rows.append({
             "drive_letter": f"{letter}:",
             "device": f"\\Device\\{best}",
-            "shared_paths": len(letter_paths & by_device[best]),
+            "shared_paths": shared,
             "match": round(scores[best] * 100, 1),
             "next_best": round(max(others) * 100, 1) if others else 0.0,
             "basis": "ReadyBoot paths matched against Layout.ini (inferred)",
         })
+
+    # One device cannot be two drive letters. When two letters both best-match the same device
+    # the evidence cannot tell them apart - and with only one device present there is no
+    # competing device for the rejection rule above to catch it, so every letter matches. Drop
+    # the whole contested set rather than pick a winner.
+    claimed: dict[str, int] = {}
+    for row in rows:
+        claimed[row["device"]] = claimed.get(row["device"], 0) + 1
+    rows = [row for row in rows if claimed[row["device"]] == 1]
 
     # Bind the serial only when there is exactly one volume AND exactly one mapped letter.
     # With one volume and two letters there is nothing to say which letter it belongs to, and

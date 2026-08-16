@@ -254,17 +254,42 @@ def main():
         a.paths = paths
         a.facts = facts or {}
         return a
+    win = [f"\\WINDOWS\\W{i}.DLL" for i in range(40)]
+    dat = [f"\\DATA\\D{i}.DAT" for i in range(40)]
     two = correlate_volumes([
-        _art("readyboot", [f"\\Device\\HarddiskVolume3\\WINDOWS\\{n}.DLL" for n in "ABC"]
-             + [f"\\Device\\HarddiskVolume9\\DATA\\{n}.DAT" for n in "XYZ"]),
-        _art("layout", [f"C:\\WINDOWS\\{n}.DLL" for n in "ABC"]
-             + [f"D:\\DATA\\{n}.DAT" for n in "XYZ"]),
+        _art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in win]
+             + [f"\\Device\\HarddiskVolume9{p}" for p in dat]),
+        _art("layout", [f"C:{p}" for p in win] + [f"D:{p}" for p in dat]),
         _art("superfetch", [], {"volumes": "\\VOLUME{01d6d2b931a49a11-cc31b5d5}"}),
     ])
-    check("two letters both map", len(two) == 2, len(two))
+    check("two letters map to their own separate devices", len(two) == 2,
+          [(r["drive_letter"], r["device"]) for r in two])
     check("one serial is NOT stamped onto two different letters",
           not any("volume_serial" in r for r in two),
           [r.get("volume_serial") for r in two])
+
+    # Three ways to get a confident wrong answer out of a percentage. Each must yield nothing.
+    many = [f"\\WINDOWS\\F{i}.DLL" for i in range(40)]
+    generic = ["\\$MFT", "\\SYSTEM VOLUME INFORMATION", "\\$LOGFILE", "\\$RECYCLE.BIN"]
+    cases = [
+        # One shared path is "100%". A percentage without a count is not evidence.
+        ("a single shared path claims nothing",
+         [_art("readyboot", ["\\Device\\HarddiskVolume3\\WINDOWS\\A.DLL"]),
+          _art("layout", ["C:\\WINDOWS\\A.DLL"])]),
+        # With only one device there is no competing device to reject against, so without an
+        # explicit check every letter matches it.
+        ("one device cannot be two letters",
+         [_art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in many]
+               + [f"\\Device\\HarddiskVolume3\\DATA\\D{i}.DAT" for i in range(40)]),
+          _art("layout", [f"C:{p}" for p in many]
+               + [f"D:\\DATA\\D{i}.DAT" for i in range(40)])]),
+        # $Mft and friends exist on every NTFS volume, so they identify none of them.
+        ("volume-generic paths claim nothing",
+         [_art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in generic + many]),
+          _art("layout", [f"D:{p}" for p in generic])]),
+    ]
+    for label, arts in cases:
+        check(label, correlate_volumes(arts) == [], correlate_volumes(arts))
     if rows:
         row = rows[0]
         check("C: maps to HarddiskVolume3",
