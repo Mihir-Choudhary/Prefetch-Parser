@@ -491,7 +491,7 @@ is a Linux build of the same spec, which settles the sizes:
 | GUI + CLI, `--onedir` (what the spec produces) | **153 MB** |
 | the same, zipped for distribution | 89 MB |
 | CLI only, `--onedir` | **24 MB** |
-| CLI only, `--onefile` | **11 MB** |
+| CLI only, `--onefile` | 11 MB — *measured for comparison; not shipped, see below* |
 
 The split is entirely Qt. The library and CLI have no dependencies, which is why dropping the
 GUI takes 179 MB to 24 MB.
@@ -524,10 +524,19 @@ and removing ICU stops Qt loading at all rather than saving 30 MB.
 Both frozen binaries were smoke-tested: the CLI parses a compressed Windows 11 prefetch file
 and resolves the executable path, and the GUI starts Qt successfully.
 
-`--onedir`, not `--onefile`, is deliberate for the GUI: onefile unpacks to a temp directory on
-every launch, which is slow for a Qt app, and self-extraction is a strong antivirus heuristic
-on top of an already frequently-flagged packed Python binary. The CLI has neither problem,
-which is why an 11 MB single-file `pfcli.exe` is a reasonable thing to ship on its own.
+**Everything ships as `--onedir`. `--onefile` is not used, for the CLI either.**
+
+A onefile binary unpacks itself into `%TEMP%\_MEIxxxx` on *every* launch. It cleans up on exit,
+but it has still written megabytes to a disk the examiner may be treating as evidence, and it
+has perturbed the very `%TEMP%` someone might be about to examine. A tool that alters the
+machine it is documenting is the wrong shape, however tidy the cleanup.
+
+Two lesser reasons point the same way: self-extraction is a strong antivirus heuristic on top
+of an already frequently-flagged packed Python binary, and the unpacking costs measurable
+startup time — 237 ms against 146 ms for onedir on the same trivial command.
+
+The 11 MB onefile figure above is recorded only because it was measured while sizing the
+options. It is not a deliverable.
 
 ### The filename hash cannot be recomputed
 
