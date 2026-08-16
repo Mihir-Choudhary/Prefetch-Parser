@@ -21,3 +21,7 @@ build/
 dist/
 *.db
 *.csv
+
+# PyInstaller writes a .spec beside the entry point when invoked ad hoc; the real one is
+# packaging/prefetch.spec.
+/*.spec
