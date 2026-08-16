@@ -249,11 +249,21 @@ def parse_readyboot(path: str, data: bytes) -> Artifact:
         art.problems.append("payload decoded but its inner format is not recognised; "
                             "no paths recovered")
         return art
-    records = _read_table(payload, *bounds)
+    records, stopped_at, replaced = _read_table(payload, *bounds)
     art.facts["name_records"] = len(records)
     if not records:
         art.problems.append("name table located but held no readable records")
         return art
+    # Both of these used to be invisible. An early stop means records were discarded, and the
+    # counts still agree afterwards, so nothing downstream can notice on the analyst's behalf.
+    if stopped_at < bounds[1]:
+        art.problems.append(
+            f"name table walk stopped {bounds[1] - stopped_at:,} bytes before its end; "
+            "records after that point were not read")
+    if replaced:
+        art.problems.append(
+            f"{replaced} name(s) contained characters that are not valid UTF-16 and were "
+            "decoded lossily")
 
     art.paths, broken = _resolve_paths(records)
     art.facts["paths_found"] = len(art.paths)
@@ -377,9 +387,22 @@ def _name_table_bounds(payload: bytes) -> tuple[int, int] | None:
     return None
 
 
-def _read_table(payload: bytes, start: int, end: int) -> dict[int, tuple[str, int]]:
-    """Parse the name table into {offset within table: (name, parent offset)}."""
+def _read_table(payload: bytes, start: int,
+                end: int) -> tuple[dict[int, tuple[str, int]], int, int]:
+    """Parse the name table. Returns (records, byte the walk stopped at, names substituted).
+
+    The walk is bounded by `end`, so it always terminates; the checks below decide where the
+    real table ends rather than whether the loop can run away.
+
+    A name that will not decode is **not** treated as the end of the table. NTFS filenames are
+    UTF-16 and Windows does not reject unpaired surrogates, so one legal-but-odd name - or one
+    corrupt byte - used to stop the walk and silently discard every record after it. Losing
+    thousands of paths that way is invisible: the record count and the path count still agree,
+    so the result looks clean. Such a name is decoded lossily and counted instead, and the
+    caller reports both the substitution and any early stop.
+    """
     records: dict[int, tuple[str, int]] = {}
+    replaced = 0
     pos = start
     while pos + _REC_HEADER <= end:
         parent, count = struct.unpack_from("<IH", payload, pos)
@@ -388,17 +411,21 @@ def _read_table(payload: bytes, start: int, end: int) -> dict[int, tuple[str, in
         stop = pos + _REC_HEADER + count * 2
         if stop > end:
             break
+        raw = payload[pos + _REC_HEADER:stop]
         try:
-            name = payload[pos + _REC_HEADER:stop].decode("utf-16-le")
+            name = raw.decode("utf-16-le")
         except UnicodeDecodeError:
-            break
+            # "replace", not "surrogatepass": a lone surrogate in a str raises when it is
+            # printed or written out, which would move the failure to the reporting surface.
+            name = raw.decode("utf-16-le", errors="replace")
+            replaced += 1
         # Real components are printable and single-line; a control character means the walk has
-        # left the table and is reading binary.
+        # left the table and is reading binary. This is the genuine end-of-table signal.
         if any(ch < " " for ch in name):
             break
         records[pos - start] = (name, parent)
         pos = stop
-    return records
+    return records, pos, replaced
 
 
 # The `xFcE` payload in front of the name table is the I/O trace itself: one 40-byte record per

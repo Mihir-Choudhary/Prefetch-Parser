@@ -242,6 +242,30 @@ def main():
           art.facts["io_unattributed"] == exact, art.facts["io_unattributed"])
     check("no non-marker path is being counted as unattributed", not inflating, inflating[:3])
 
+    print("\none undecodable name does not discard the rest of the name table:")
+    from prefetch_core.artifacts import _read_table, _resolve_paths
+    NO_PARENT_ = 0xFFFFFFFF
+
+    def _rec(parent, text, chars):
+        return _st.pack("<IH", parent, chars) + text
+
+    table = bytearray()
+    table += _rec(NO_PARENT_, "Test".encode("utf-16-le"), 4)
+    table += _rec(0, b"\x00\xd8", 1)          # lone high surrogate: legal in an NTFS name
+    table += _rec(0, "After".encode("utf-16-le"), 5)
+    table += _rec(0, "Later".encode("utf-16-le"), 5)
+    recs, stopped, replaced = _read_table(bytes(table), 0, len(table))
+    # Strict decoding used to stop here, keeping 1 of 4 and reporting nothing - and the record
+    # count matched the path count afterwards, so the loss was invisible.
+    check("all four records survive one bad name", len(recs) == 4, len(recs))
+    check("the walk reaches the end of the table", stopped == len(table), stopped)
+    check("the lossy decode is counted", replaced == 1, replaced)
+    names, _broken = _resolve_paths(recs)
+    check("recovered names are safe to print", all(isinstance(n, str) for n in names))
+    # A lone surrogate would raise on encode; "replace" is what keeps the reporting surface safe.
+    check("no lone surrogate reaches the output",
+          all(n.encode("utf-8", errors="strict") for n in names))
+
     print("\nvolume identity is correlated across artifacts, and withheld when unsupported:")
     from prefetch_core.artifacts import correlate_volumes, scan_folder
     rows = correlate_volumes(scan_folder(corpus.WIN11))
