@@ -392,9 +392,21 @@ def cmd_ads(args):
 def cmd_artifacts(args):
     from prefetch_core.artifacts import scan_folder
 
-    found = scan_folder(args.folder)
+    # A bad path and a clean folder used to print the same line and both exit 0, so
+    # `pfcli artifacts "$DIR" && echo clean` reported clean for a typo or an unmounted share.
+    # "scanned and found nothing" is evidence; "never scanned" is not.
+    try:
+        found = scan_folder(args.folder)
+    except NotADirectoryError:
+        print(f"not a directory: {args.folder}\n"
+              "`artifacts` scans a Prefetch folder - pass the folder, not a file in it.",
+              file=sys.stderr)
+        return 1
+    except (FileNotFoundError, OSError) as exc:
+        print(f"cannot scan {args.folder}: {exc}", file=sys.stderr)
+        return 1
     if not found:
-        print("no non-.pf artifacts found")
+        print(f"scanned {args.folder}: no non-.pf artifacts found")
         return 0
     for a in found:
         stamp = a.modified.strftime("%Y-%m-%d %H:%M") if a.modified else "-"

@@ -596,7 +596,16 @@ def scan_folder(root: str, progress=None) -> list[Artifact]:
     a second - decompressing 8 MB and resolving ~200,000 I/O events - so a folder with five of
     them blocks for several seconds. A caller with a UI needs to be able to say so rather than
     appear to hang.
+
+    Raises if `root` is not a readable directory. `os.walk` yields nothing for a missing or
+    non-directory path, which would make "this folder holds no artifacts" - real evidence -
+    indistinguishable from "this path was never scanned". The same distinction `AdsUnavailable`
+    exists to preserve.
     """
+    if not os.path.exists(root):
+        raise FileNotFoundError(f"no such path: {root}")
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"not a directory: {root}")
     found = []
     for dirpath, _dirs, names in os.walk(root):
         for n in sorted(names):

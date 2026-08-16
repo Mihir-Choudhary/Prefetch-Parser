@@ -123,6 +123,24 @@ def main():
     check("a genuinely empty path does not invent artifacts",
           "other Prefetch-folder artifact" not in err)
 
+    print("\n`artifacts` separates 'scanned and clean' from 'never scanned':")
+    # All three used to print the same line and exit 0, so
+    # `pfcli artifacts "$DIR" && echo clean` reported clean for a typo or an unmounted share.
+    empty_dir = os.path.join(tmp, "empty-for-artifacts")
+    os.makedirs(empty_dir, exist_ok=True)
+    code, out, err = run("artifacts", empty_dir)
+    check("an empty folder is a clean SCAN, exit 0", code == 0, f"exit={code}")
+    check("and says it actually scanned it", "scanned" in out, out.strip()[:60])
+
+    code, out, err = run("artifacts", os.path.join(tmp, "no-such-folder-here"))
+    check("a missing path fails, exit 1", code == 1, f"exit={code}")
+    check("and does not claim 'no artifacts found'",
+          "no non-.pf artifacts found" not in out, out.strip()[:60])
+
+    code, out, err = run("artifacts", SEED)          # a file, not a folder
+    check("a file where a folder belongs fails, exit 1", code == 1, f"exit={code}")
+    check("and explains what to pass instead", "not a directory" in err, err.strip()[:60])
+
     print("\nsuccess path still returns 0:")
     code, out, err = run("parse", SEED, "--csv", os.path.join(tmp, "fine.csv"))
     check("clean run exits zero", code == 0, f"exit={code}")
