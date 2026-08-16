@@ -351,6 +351,14 @@ def cmd_ads(args):
         print(f"!! alternate data streams cannot be enumerated: {exc}", file=sys.stderr)
         print("   Run this on Windows, or supply a raw NTFS image.", file=sys.stderr)
         return 2
+    except NotADirectoryError:
+        print(f"not a directory: {args.folder}\n"
+              "`ads` walks a folder - pass the folder, not a file in it.", file=sys.stderr)
+        return 1
+    except (FileNotFoundError, OSError) as exc:
+        # Same reason as above: a path that was never scanned must not read as a clean scan.
+        print(f"!! cannot scan {args.folder}: {exc}", file=sys.stderr)
+        return 1
 
     if not findings:
         print(f"scanned {args.folder}: no prefetch found in any alternate data stream")

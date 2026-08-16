@@ -329,11 +329,21 @@ def scan_tree(root: str, backend=None, include_directories: bool = True) -> list
     Every file is examined regardless of extension, because a hidden prefetch will not be
     named like one. Directories are examined too: NTFS directory objects carry streams and
     both of PECmd's enumeration paths are files-only, so it cannot see them at all.
+
+    Raises if `root` cannot be walked. `os.walk` yields nothing for a missing path or a file,
+    so without this a typo reported "scanned, no prefetch in any stream" - the same answer as a
+    genuinely clean folder. That is the failure this module exists to prevent, and it matters
+    more here than anywhere else in the tool: this is the search for deliberately hidden
+    evidence, so a false clean is the worst possible result.
     """
     backend = backend or default_backend()
     if backend is None:
         raise AdsUnavailable(
             "no ADS backend: FindFirstStreamW is unavailable and no NTFS image was supplied")
+    if not os.path.exists(root):
+        raise FileNotFoundError(f"no such path: {root}")
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"not a directory: {root}")
 
     findings = []
     for dirpath, _dirnames, filenames in os.walk(root):

@@ -568,6 +568,27 @@ def main():
     check("  notes are searchable", win12.proxy.rowCount() >= 1, True)
     win12.proxy.clear_filters()
 
+    print("\nan unopenable path is not reported as an empty scan:")
+    # A missing path and a genuinely empty folder both warned "No .pf files and no other
+    # recognised artifacts found", so a typo or an unmounted share read as a completed scan.
+    import tempfile as _tf3
+    from pfgui.__main__ import MainWindow as _MW
+    seen = []
+    with _patch("pfgui.__main__.QMessageBox.warning",
+                side_effect=lambda *a, **k: seen.append(a[1])), \
+         _patch("pfgui.__main__.QMessageBox.information",
+                side_effect=lambda *a, **k: seen.append(a[1])):
+        empty_dir = _tf3.mkdtemp()
+        seen.clear()
+        _MW().load([os.path.join(empty_dir, "no-such-folder")])
+        missing_title = list(seen)
+        seen.clear()
+        _MW().load([empty_dir])
+        empty_title = list(seen)
+    check("a missing path says it could not open", missing_title, ["Cannot open"])
+    check("an empty folder still reports a real scan", empty_title, ["Nothing loaded"])
+    check("the two are distinguishable", missing_title != empty_title, True)
+
     print("\nPASS" if not failures else f"\nFAIL: {failures}")
     return 0 if not failures else 1
 

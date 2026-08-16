@@ -246,6 +246,28 @@ def main():
     check("the declared/actual mismatch is reported",
           any("declared" in p for p in lied[0].problems), True)
 
+    print("\na path that cannot be walked is not reported as a clean scan:")
+    # os.walk yields nothing for a missing path or a file, so scan_tree used to return 0
+    # findings and the CLI printed "scanned X: no prefetch found in any alternate data stream".
+    # Off Windows the missing backend hid this; with a backend present it is reachable, and a
+    # false clean is the worst possible answer when hunting deliberately hidden evidence.
+    import tempfile as _tf2
+    walkable = _tf2.mkdtemp()
+    for label, target, expected in (
+        ("a missing folder", os.path.join(walkable, "nope"), FileNotFoundError),
+        ("a file, not a folder", __file__, NotADirectoryError),
+    ):
+        try:
+            ads.scan_tree(target, FakeBackend({}))
+            check(f"{label} raises rather than reporting clean", False, "returned quietly")
+        except expected:
+            check(f"{label} raises rather than reporting clean", True, True)
+        except Exception as exc:  # noqa: BLE001 - wrong type is itself the failure
+            check(f"{label} raises rather than reporting clean", False,
+                  f"{type(exc).__name__}: {exc}")
+    got = ads.scan_tree(walkable, FakeBackend({}))
+    check("a real empty folder still scans cleanly", got, [])
+
     print("\ncreation time is read correctly per platform:")
     from prefetch_core.winpath import creation_time
     from unittest.mock import patch as _p

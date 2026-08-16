@@ -327,6 +327,22 @@ class MainWindow(QMainWindow):
 
     # -- data --------------------------------------------------------------
     def load(self, paths):
+        # A path that does not exist, and a folder that is genuinely empty, used to produce the
+        # same "nothing found" warning - so a typo or an unmounted share read as a completed
+        # scan. Only one of those is evidence. Refuse the unusable paths by name before any of
+        # them can be mistaken for a clean result.
+        unusable = [p for p in paths
+                    if not os.path.isdir(p) and not (os.path.isfile(p)
+                                                     and p.lower().endswith(".pf"))]
+        if unusable:
+            QMessageBox.warning(
+                self, "Cannot open",
+                "These paths could not be opened, so nothing was scanned:\n\n"
+                + "\n".join(f"  {p}   ({'no such path' if not os.path.exists(p) else 'not a Prefetch folder or .pf file'})"
+                            for p in unusable[:8]))
+            if len(unusable) == len(paths):
+                return
+
         files = []
         for p in paths:
             if os.path.isdir(p):
