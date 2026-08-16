@@ -268,6 +268,72 @@ def main():
     got = ads.scan_tree(walkable, FakeBackend({}))
     check("a real empty folder still scans cleanly", got, [])
 
+    print("\nstream enumeration tells end-of-list apart from a failure:")
+    # FindNextStreamW returns FALSE both at the end of the list and on a real error, and the
+    # two are only distinguishable by GetLastError. Treating every FALSE as the end silently
+    # truncates the stream list - in the routine whose entire job is finding hidden streams.
+    import ctypes as _ct
+    from unittest.mock import patch as _patch2
+    _SD = ads._Win32Backend._WIN32_FIND_STREAM_DATA
+
+    class _StubK32:
+        def __init__(self, stop_after):
+            self.n = 0
+            self.stop_after = stop_after
+
+        def FindFirstStreamW(self, path, level, buf, flags):
+            d = _ct.cast(buf, _ct.POINTER(_SD)).contents
+            d.StreamSize, d.cStreamName = 0, "::$DATA"
+            return 1234
+
+        def FindNextStreamW(self, handle, buf):
+            self.n += 1
+            if self.n > self.stop_after:
+                return False
+            d = _ct.cast(buf, _ct.POINTER(_SD)).contents
+            d.StreamSize, d.cStreamName = 100, f":hidden{self.n}:$DATA"
+            return True
+
+        def FindClose(self, handle):
+            return True
+
+    backend32 = object.__new__(ads._Win32Backend)
+    backend32.kernel32 = _StubK32(stop_after=2)
+    with _patch2.object(ads, "_get_last_error", lambda: 38):        # ERROR_HANDLE_EOF
+        got = backend32.list_streams(r"C:\case\HOST.TXT")
+    check("a genuine end of list returns every stream", len(got), 3)
+
+    backend32 = object.__new__(ads._Win32Backend)
+    backend32.kernel32 = _StubK32(stop_after=2)
+    with _patch2.object(ads, "_get_last_error", lambda: 5):         # ERROR_ACCESS_DENIED
+        try:
+            backend32.list_streams(r"C:\case\HOST.TXT")
+            check("a mid-enumeration failure raises", False, "returned a truncated list")
+        except OSError as exc:
+            check("a mid-enumeration failure raises", exc.errno, 5)
+
+    print("\nentries that refuse enumeration are reported, not silently skipped:")
+    # On a live system these are the in-use and ACL-restricted files - exactly where a payload
+    # would be hidden. Skipping them quietly turns "could not examine N files" into "clean".
+    import tempfile as _tf4
+    walk_dir = _tf4.mkdtemp()
+    for _n in ("a.txt", "b.txt", "c.txt"):
+        with open(os.path.join(walk_dir, _n), "w") as _fh:
+            _fh.write("x")
+
+    class _Flaky(FakeBackend):
+        def list_streams(self, path):
+            if path.endswith("b.txt"):
+                raise OSError(5, "Access is denied")
+            return []
+
+    noticed = []
+    ads.scan_tree(walk_dir, _Flaky({}), on_error=lambda p, e: noticed.append(p))
+    check("the unreadable entry is surfaced", len(noticed), 1)
+    check("and it is the right one", os.path.basename(noticed[0]) if noticed else "", "b.txt")
+    check("the walk still completes past it",
+          ads.scan_tree(walk_dir, _Flaky({})), [])
+
     print("\ncreation time is read correctly per platform:")
     from prefetch_core.winpath import creation_time
     from unittest.mock import patch as _p

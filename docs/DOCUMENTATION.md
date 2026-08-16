@@ -55,6 +55,10 @@ python -m pfcli capabilities
 `parse` accepts files or folders and recurses by default (ReadyBoot lives in a subfolder).
 Overlapping arguments are de-duplicated, so `parse FOLDER FOLDER` does not double every row.
 
+`ads` reports every entry whose streams could not be enumerated and **exits `1`** when any
+were skipped, because a locked or ACL-restricted file is not a file that came back clean — and
+on a live system those are exactly the ones worth hiding a payload in.
+
 `artifacts` distinguishes **"scanned and found nothing"** (exit `0`, and it names the folder it
 scanned) from **"could not scan"** — a missing path, or a file passed where a folder belongs —
 which exits `1`. The first is evidence; the second is not, and `pfcli artifacts "$DIR" && …`

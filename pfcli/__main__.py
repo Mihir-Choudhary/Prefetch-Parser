@@ -343,8 +343,10 @@ def cmd_ads(args):
     """Recover prefetch hidden in NTFS alternate data streams."""
     from prefetch_core import ads
 
+    skipped = []
     try:
-        findings = ads.scan_tree(args.folder, include_directories=not args.files_only)
+        findings = ads.scan_tree(args.folder, include_directories=not args.files_only,
+                                 on_error=lambda p, exc: skipped.append((p, exc)))
     except ads.AdsUnavailable as exc:
         # Never print "0 found" here. "Could not look" and "looked and found nothing" are
         # different answers and only one of them is evidence.
@@ -360,9 +362,21 @@ def cmd_ads(args):
         print(f"!! cannot scan {args.folder}: {exc}", file=sys.stderr)
         return 1
 
+    def report_skipped():
+        """Entries that refused enumeration are not entries that came back clean."""
+        if not skipped:
+            return
+        print(f"\n!! {len(skipped)} entr(ies) could not be examined - "
+              f"this scan is INCOMPLETE:", file=sys.stderr)
+        for target, exc in skipped[:10]:
+            print(f"   {target}: {exc}", file=sys.stderr)
+        if len(skipped) > 10:
+            print(f"   … and {len(skipped) - 10} more", file=sys.stderr)
+
     if not findings:
         print(f"scanned {args.folder}: no prefetch found in any alternate data stream")
-        return 0
+        report_skipped()
+        return 1 if skipped else 0
 
     records = ads.parse_findings(findings, prefer_decompressor=args.decompressor)
     for finding, pf in zip(findings, records):
@@ -394,7 +408,8 @@ def cmd_ads(args):
     print(f"\n{len(findings)} prefetch file(s) recovered from alternate data streams.")
     print("Timestamps shown are the CARRIER's - a stream has none of its own, so "
           "first-run estimates are unavailable for these records.")
-    return 0
+    report_skipped()
+    return 1 if skipped else 0
 
 
 def cmd_artifacts(args):

@@ -46,6 +46,13 @@ from .limits import MAX_STREAM_BYTES
 _FIND_STREAM_INFO_STANDARD = 0
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _ERROR_HANDLE_EOF = 38
+
+# ctypes exposes get_last_error/set_last_error on Windows only. This backend runs only there,
+# but its enumeration logic must stay exercisable off-Windows against a stub kernel32 - the
+# alternative is code that cannot be tested until it is already in front of an analyst, which
+# is how the missing FindNextStreamW error check survived this long. Tests patch these.
+_get_last_error = getattr(ctypes, "get_last_error", lambda: 0)
+_set_last_error = getattr(ctypes, "set_last_error", lambda _value: None)
 # NTFS names the unnamed primary stream "::$DATA"; everything else is an ADS.
 _PRIMARY_STREAM = "::$DATA"
 
@@ -141,7 +148,7 @@ class _Win32Backend:
         handle = self.kernel32.FindFirstStreamW(
             ctypes.c_wchar_p(path), _FIND_STREAM_INFO_STANDARD, ctypes.byref(data), 0)
         if handle in (None, _INVALID_HANDLE_VALUE):
-            err = ctypes.get_last_error()
+            err = _get_last_error()
             if err == _ERROR_HANDLE_EOF:
                 return []
             raise OSError(err, f"FindFirstStreamW failed on {path!r}")
@@ -149,7 +156,18 @@ class _Win32Backend:
         try:
             while True:
                 streams.append(Stream(path, data.cStreamName, data.StreamSize))
+                # Clear first: the value is only meaningful for the call that just failed.
+                _set_last_error(0)
                 if not self.kernel32.FindNextStreamW(handle, ctypes.byref(data)):
+                    err = _get_last_error()
+                    # FALSE means end-of-enumeration ONLY when the error is ERROR_HANDLE_EOF.
+                    # Any other error is a real failure, and treating it as the end silently
+                    # truncates the stream list - in the one routine whose whole purpose is
+                    # finding streams somebody hid. FindFirstStreamW above already makes this
+                    # distinction; leaving it out here was an asymmetry, not a decision.
+                    if err not in (0, _ERROR_HANDLE_EOF):
+                        raise OSError(err, f"FindNextStreamW failed on {path!r} after "
+                                           f"{len(streams)} stream(s); the list is incomplete")
                     break
         finally:
             self.kernel32.FindClose(handle)
@@ -323,12 +341,17 @@ def _is_outside(path: str, prefetch_folder: str | None) -> bool:
     return "\\prefetch" not in path.lower().replace("/", "\\")
 
 
-def scan_tree(root: str, backend=None, include_directories: bool = True) -> list[AdsFinding]:
+def scan_tree(root: str, backend=None, include_directories: bool = True,
+              on_error=None) -> list[AdsFinding]:
     """Walk `root` looking for prefetch in any stream on any file - or directory.
 
     Every file is examined regardless of extension, because a hidden prefetch will not be
     named like one. Directories are examined too: NTFS directory objects carry streams and
     both of PECmd's enumeration paths are files-only, so it cannot see them at all.
+
+    `on_error(path, exception)` is called for every entry whose streams could not be
+    enumerated. Pass one: an entry that refused to be examined is not an entry that was
+    examined and found clean, and only the caller can report the difference.
 
     Raises if `root` cannot be walked. `os.walk` yields nothing for a missing path or a file,
     so without this a typo reported "scanned, no prefetch in any stream" - the same answer as a
@@ -356,8 +379,19 @@ def scan_tree(root: str, backend=None, include_directories: bool = True) -> list
         for target in targets:
             try:
                 findings.extend(scan_file(target, backend, prefetch_folder=root))
-            except (OSError, AdsUnavailable):
-                continue                   # unreadable entry; keep walking
+            except OSError as exc:
+                # Keep walking - one locked file must not end the scan - but never silently.
+                # On a live system the entries that refuse enumeration are the in-use and
+                # ACL-restricted ones, which is exactly where someone would hide a payload.
+                # Skipping them without a word turns "could not examine 40 files" into "no
+                # prefetch found in any alternate data stream".
+                #
+                # AdsUnavailable is deliberately NOT caught: the backend was resolved above and
+                # is passed explicitly, so scan_file cannot raise it here. Catching it anyway
+                # would mask exactly the condition it exists to signal.
+                if on_error is not None:
+                    on_error(target, exc)
+                continue
     return findings
 
 
