@@ -481,10 +481,41 @@ The Windows-specific paths — the `ntdll` decompressor and `FindFirstStreamW` s
 enumeration — are written and unit-tested against a simulated backend, but **have never
 executed on Windows**. Everything above those calls is tested; the calls themselves are not.
 
-### Not packaged
+### No Windows `.exe` yet — but the bundle has now been built and measured
 
-There is no `.exe` yet. The PyInstaller spec and build script exist and the frozen-build
-hazards are fixed, but no bundle has been produced.
+PyInstaller does not cross-compile, so a `.exe` has to be produced **on Windows**. What exists
+is a Linux build of the same spec, which settles the sizes:
+
+| Build | Size |
+|---|---|
+| GUI + CLI, `--onedir` (what the spec produces) | **179 MB** |
+| the same, zipped for distribution | 108 MB |
+| CLI only, `--onedir` | **24 MB** |
+| CLI only, `--onefile` | **11 MB** |
+
+The split is entirely Qt. The library and CLI have no dependencies, which is why dropping the
+GUI takes 179 MB to 24 MB.
+
+About **70 MB of the GUI bundle is reachable-but-unused**, measured per inode (the tree
+hardlinks, so summing file sizes double-counts):
+
+| Component | Size | Why it is there |
+|---|---|---|
+| `libicudata` | 30.6 MB | Qt internationalisation tables |
+| Qt Quick / Qml / Pdf / Network | 23.7 MB | never imported — the GUI uses only QtWidgets, QtCore, QtGui |
+| GTK theme | 8.3 MB | Linux platform integration; absent on a Windows build |
+| OpenSSL | 7.1 MB | pulled in by Qt Network |
+
+Excluding those brings the GUI bundle to roughly **110 MB**, and a Windows build starts ~8 MB
+lower again because the GTK theme is not involved.
+
+Both frozen binaries were smoke-tested: the CLI parses a compressed Windows 11 prefetch file
+and resolves the executable path, and the GUI starts Qt successfully.
+
+`--onedir`, not `--onefile`, is deliberate for the GUI: onefile unpacks to a temp directory on
+every launch, which is slow for a Qt app, and self-extraction is a strong antivirus heuristic
+on top of an already frequently-flagged packed Python binary. The CLI has neither problem,
+which is why an 11 MB single-file `pfcli.exe` is a reasonable thing to ship on its own.
 
 ### The filename hash cannot be recomputed
 
