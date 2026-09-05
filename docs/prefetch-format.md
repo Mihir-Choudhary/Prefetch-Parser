@@ -33,7 +33,8 @@ filename offsets reproducing the NUL-split list, bounded directory-string walk,
 `TotalDirectoryCount` against the summed per-volume lists, and RunCount plausibility against
 the retained run times. **Re-run it after any edit here.**
 
-The decoder decompresses **all 642 MAM files with zero failures**, so v30/v31 are measured on
+The decoder decompresses **all 642 MAM files with zero failures** (6 vendored + 184 Win10 +
+452 Win11 - 652 across all four corpora), so v30/v31 are measured on
 real data rather than inferred.
 
 ---
@@ -255,6 +256,42 @@ Entry sizes, measured on 566 v30/v31 files across both corpora: metrics **32**, 
 
 ---
 
+### 3.2 Undecoded fields are kept, not dropped
+
+The 84-byte header (+8, +80), the tail of the file-information section, and the tail of every
+volume entry hold dwords that no published description names and that are **populated on real
+files** — e.g. `1200000000` recurring at two offsets on v23 and one on v31. All are retained
+verbatim on the record (`header_raw`, `fileinfo_raw`, `Volume.raw_tail`) and listed by
+`pfcli info`, which prints every dword of the file-information section that this parser cannot
+name. Keeping them costs a few hundred bytes per record; dropping them would make a field
+nobody has decoded yet unrecoverable from the tool's own output.
+
+### 3.3 Residue: bytes belonging to no field at all
+
+The prefetcher rewrites a `.pf` in place and does not zero what it no longer needs. Where the
+new contents are shorter than the old, fragments of the **previous version of the same record**
+survive — in the tail, and sometimes in the alignment padding between structures.
+
+Measured (2026-08-30, all four corpora — 754 files): **134 files carry residue, 1,708 bytes in
+170 regions, 4–20 bytes each**. Over the three real collections alone (699 files, excluding the
+vendored upstream samples) it is 111 files and 1,396 bytes. Examples: `TY\RESO` at the end of an
+`ANTIGRAVITY.EXE` record and `LES\WIN` in a `CLAUDE.EXE` one — both tails of paths the record
+used to hold.
+
+The parser's bounds-checked reader records every range it touches, so the complement is exactly
+what no field accounts for. Any non-zero run in there is reported as `residue` (CSV
+`ResidueBytes`/`ResidueText`, one row per region in the database, listed by `pfcli info`) and
+is never merged into the parsed lists. `reference/test_byte_coverage.py` asserts that no
+non-zero byte of any corpus file escapes both the parser and this report.
+
+A hostile file could be an alternation of read fields and non-zero gaps, so what is *kept* is
+bounded twice over: at most 256 regions, at most 4 KB from any one region, and at most 64 KB
+retained per record in total. The **reported** total is always the true one — the record says
+how many bytes in how many regions it found and how much of that it did not retain — so the
+bound costs evidence only where the file is already pathological, and says so when it does.
+
+---
+
 ## 4. File metrics array — at `FileMetricsOffset`, `FileMetricsCount` entries
 
 One entry per loaded file, index-aligned with the filename strings list
@@ -274,13 +311,48 @@ One entry per loaded file, index-aligned with the filename strings list
 
 | Off | Size | Field |
 |---|---|---|
-| 0 | 4 | unknown0 |
-| 4 | 4 | unknown1 |
-| 8 | 4 | unknown2 |
+| 0 | 4 | **TraceChainStart** — index of this file's first trace-chain entry (was "unknown0") |
+| 4 | 4 | **TraceChainCount** — how many chain entries belong to this file (was "unknown1") |
+| 8 | 4 | **TraceChainSubset** — never exceeds the count; equals it about half the time |
 | 12 | 4 | FilenameStringOffset — **byte** offset rel. to `FilenameStringsOffset` |
 | 16 | 4 | FilenameStringSize — **character** count, excluding the NUL |
-| 20 | 4 | unknown3 |
+| 20 | 4 | **Flags** — small bitfield, tracks file type (was "unknown3") |
 | 24 | 8 | **MFT file reference** (see §7) |
+
+### 4.0a The first two dwords are the file's slice of the trace-chain array (measured)
+
+Every published description of this format, this document included until 2026-08-27, calls
+offsets +0 and +4 unknown. They are not.
+
+**Measured across 284 files spanning all five versions:**
+
+```
+sum(TraceChainCount over all metrics)              == TraceChainsCount   (284/284 files)
+last.TraceChainStart + last.TraceChainCount        == TraceChainsCount   (284/284 files)
+TraceChainStart[i+1] - TraceChainStart[i]          == TraceChainCount[i] (26,344/26,344 pairs)
+```
+
+The slices **tile the array exactly** — no gap, no overlap, starting at 0. So each loaded file
+owns a contiguous run of trace-chain entries, and the two arrays that every tool treats as
+unrelated lists are in fact one relation: *this file caused these block loads.*
+
+That makes "how much of the prefetcher's work did each file account for" answerable — e.g. in
+`PING.EXE-B29F6629.pf`, `NTDLL.DLL` owns 98 chain entries and `APISETSCHEMA.DLL` owns 1.
+
+`TraceChainSubset` (+8, absent on v17) is `<= TraceChainCount` on every entry measured and
+equal to it in about half, so it is a subset of the file's own chains — plausibly the blocks
+actually fetched. Reported as a number, **not** given a name it has not earned.
+
+`Flags` (+20) takes 14 distinct values across the corpus and **correlates** with file type
+without mapping onto it - DLLs are `0x100` in 4,624 of ~7,700 entries but also `1` (1,584),
+`0x300` (884) and `0x200` (645); `.NLS`/`.MUI`/`.JS` files cluster on `1`/`2`/`4`. No individual
+bit has been identified. Surfaced raw, and described here as a distribution rather than a
+meaning.
+
+### Version 17 — the same two fields, shifted
+
+v17's 20-byte entry carries TraceChainStart at +0 and TraceChainCount at +4 exactly as above,
+with Flags at +16 where later versions have +20.
 
 The MFT reference from v23 onward is the forensically valuable part: it ties each loaded
 filename to a concrete MFT record, which survives renames and lets you correlate against
@@ -543,7 +615,17 @@ First 36 bytes are identical across all versions:
 | 24 | 4 | FileReferencesSize |
 | 28 | 4 | DirectoryStringsOffset (**rel. to `VolumesInfoOffset`**) |
 | 32 | 4 | NumberOfDirectoryStrings |
-| 36 | … | unknown, pads out to the version's entry size |
+| 36 | … | unknown, pads out to the version's entry size — **kept verbatim**, see below |
+
+The file-reference array itself begins with two dwords, not one: `[version][count]`. The
+version is **3 on every file measured** and was previously skipped along with everything else
+at +0.
+
+**Declared-but-unused array slack.** `FileReferencesSize` sometimes reserves more room than
+`count` uses. On **19 of 183** files measured the leftover holds exactly one reference-shaped
+8-byte value — a plausible MFT entry/sequence pair the file does not count. Recovered and
+reported **separately** from the declared references (`source='slack'` in the database), never
+merged into them.
 
 Device name: read `DeviceNameLength * 2` bytes at `VolumesInfoOffset + DeviceNameOffset`,
 decode UTF-16LE. Two forms occur:

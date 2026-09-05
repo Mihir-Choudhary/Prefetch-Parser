@@ -48,18 +48,44 @@ wrong:
 - one device explains at least half of the letter's paths, and
 - every other device explains essentially none (≤2%), and
 - at least 20 paths are actually shared — *one* shared path is also "100%", and
+- at least **five of those shared paths are ones a stock Windows would not have**, and
 - no other letter best-matches the same device — one device cannot be two letters, and with
   only one device present there is no competing device for the second rule to catch.
 
+The fourth rule is there because a folder can be assembled from **two machines** — triage output
+gets merged, folders get copied into one place, and nothing inside the artifacts says which
+computer they came from. Every Windows installation shares `\WINDOWS\SYSTEM32\NTOSKRNL.EXE`, so
+a match built only from system files says "both of these are Windows", not "both of these are
+this machine". Measured: one machine's `Layout.ini` beside another's ReadyBoot traces produced
+`C: = \Device\HarddiskVolume3` at **88.8%** — a confident mapping between a letter on one disk
+and a device on another. On the real folder, **1,402 of the 4,238** shared paths are
+machine-specific (installed software, user profiles); across the two machines, **zero** of the
+79 are.
+
+A letter refused for that reason is **reported, not silently omitted**: the analyst is told what
+matched and why it was not claimed, because "no evidence" and "evidence that proves nothing" are
+different findings.
+
 Paths that exist on every NTFS volume (`$Mft`, `$LogFile`, `System Volume Information`,
-`$Recycle.Bin`, anything beginning `$`) are excluded from both sides before scoring. Left in,
-a drive letter whose only known paths are filesystem metadata matches *any* device at 100% and
-gets mapped to the wrong one.
+`$Recycle.Bin`, anything beginning `$`) are excluded from both sides before scoring, matched
+**case-insensitively** — Windows writes `System Volume Information` in mixed case, and until
+Round 46 the comparison was case-sensitive against an upper-case list, so the spelling that
+actually occurs walked straight through the filter. Left in, a drive letter whose only known
+paths are filesystem metadata matches *any* device at 100% and gets mapped to the wrong one.
+
+Device names are grouped case-insensitively for the same reason: a trace that spelled one
+device two ways used to split it into two competitors, and the fourth rule above then threw the
+true mapping away.
 
 If any of that fails the tool reports nothing, because a wrong drive letter in a report is worse
 than a missing one.
 
-`pfcli artifacts` prints this under **Volume identity**, labelled inferred.
+`pfcli artifacts` and the GUI both print this under **Volume identity**, from one shared
+renderer (`describe_identities()`), and every row states its own basis. A drive letter is always
+labelled inferred. A **SuperFetch volume record that names `\Device\HarddiskVolumeN` outright**
+is not an inference at all and is labelled as stated — with its measurement columns empty,
+because no match was measured to produce it. Where both exist for one device they are one row:
+the letter inferred, the serial and creation time stated.
 
 ## 2. One volume identity across four artifacts
 

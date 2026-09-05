@@ -24,7 +24,10 @@ from PySide6.QtWidgets import (
     QTabWidget, QTextEdit, QVBoxLayout, QWidget, QMenu, QDialog,
 )
 
+from prefetch_core.export import write_artifact_csv
+from prefetch_core.output import CellWidths, atomic_write, make_stdio_safe
 from prefetch_core import parse_file  # noqa: E402
+from prefetch_core.winpath import escape_deceptive  # noqa: E402
 from pfgui.detailpanes import SearchableTable  # noqa: E402
 from pfgui.filterpopup import FilterPopup  # noqa: E402
 from pfgui.model import COLUMNS, FilterProxy, PrefetchTableModel, row_from  # noqa: E402
@@ -45,6 +48,10 @@ class MainWindow(QMainWindow):
         # an analyst who hides twelve columns to make the grid readable should not redo it
         # every launch.
         self.settings = QSettings("prefetch-explorer", "pfgui")
+        # source_path -> (tag, note). Survives a re-scan; see load(). In memory only: tagging
+        # is a statement about this session's evidence, and writing it to the analyst's home
+        # directory would put case data somewhere they did not choose.
+        self._annotations: dict[str, tuple[str, str]] = {}
 
         self._build_ui()
         self._build_menu()
@@ -103,7 +110,10 @@ class MainWindow(QMainWindow):
             ["Vol", "Device", "Serial", "Created (UTC)", "Name check", "Directory"],
             "Filter volumes and directories…")
         self.detail_files = SearchableTable(
-            ["#", "Loaded file", "MFT entry", "MFT seq"], "Filter loaded files…")
+            # "Chains" is how many trace-chain entries this file accounts for, "fetched" the
+            # subset of them the metric records; both come from fields other tools discard.
+            ["#", "Loaded file", "MFT entry", "MFT seq", "Chains", "Fetched", "Flags"],
+            "Filter loaded files…")
         # Folder-level artifacts do NOT belong in here. Every other tab in this pane describes
         # the selected record; this one described the whole folder and was byte-identical for
         # every row. Sitting alongside four per-record tabs, the layout itself implied a
@@ -112,6 +122,8 @@ class MainWindow(QMainWindow):
         self.detail_artifacts = QTextEdit(readOnly=True)
         self.detail_artifacts.setLineWrapMode(QTextEdit.NoWrap)
         self.artifacts_window = None
+        self.loaded_paths = []
+        self._artifacts = []
         self.detail_summary.setLineWrapMode(QTextEdit.NoWrap)
         # Both panes lay values out in columns using space padding, which only lines up in a
         # fixed-pitch font. The default here is proportional Sans Serif: four labels padded to
@@ -149,6 +161,8 @@ class MainWindow(QMainWindow):
                                       ("Export tagged…", self._export_tagged, "Ctrl+E"),
                                       ("Export current view…", self._export_view, "Ctrl+Shift+E"),
                                       ("Folder artifacts…", self._show_artifacts, "Ctrl+R"),
+                                      ("Export folder artifacts…", self._export_artifacts,
+                                       "Ctrl+Shift+R"),
                                       ("Quit", self.close, "Ctrl+Q")):
             a = QAction(label, self)
             a.triggered.connect(slot)
@@ -213,7 +227,7 @@ class MainWindow(QMainWindow):
         save = QAction("Save current filters as…", self)
         save.triggered.connect(self._save_view)
         self.views_menu.addAction(save)
-        saved = self.settings.value("saved_views") or {}
+        saved = self._saved_views_setting()
         if saved:
             self.views_menu.addSeparator()
             for name in sorted(saved):
@@ -235,7 +249,7 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Save view", "Name:")
         if not ok or not name.strip():
             return
-        saved = dict(self.settings.value("saved_views") or {})
+        saved = dict(self._saved_views_setting())
         saved[name.strip()] = {
             "filters": {COLUMNS[c][1]: sorted(v) for c, v in self.proxy.allowed.items()},
             "search": self.proxy.search,
@@ -245,7 +259,7 @@ class MainWindow(QMainWindow):
         self._refresh_views_menu()
 
     def _apply_saved_view(self, name):
-        saved = (self.settings.value("saved_views") or {}).get(name)
+        saved = self._saved_views_setting().get(name)
         if not saved:
             return
         by_key = {key: c for c, (_label, key) in enumerate(COLUMNS)}
@@ -267,12 +281,52 @@ class MainWindow(QMainWindow):
                                 + "\n  ".join(missing))
 
     def _delete_view(self, name):
-        saved = dict(self.settings.value("saved_views") or {})
+        saved = dict(self._saved_views_setting())
         saved.pop(name, None)
         self.settings.setValue("saved_views", saved)
         self._refresh_views_menu()
 
     # -- persistence -------------------------------------------------------
+    def _hidden_columns_setting(self) -> list[int]:
+        """Which columns to hide, from a settings file that may contain anything.
+
+        QSettings is a file on disk. Another build, a settings sync, a hand edit or a partial
+        write can put a string, a stale column index or plain nonsense in it - and `int(x)`
+        over that raised straight out of `__init__`, so the window would not open AT ALL and
+        the analyst got a traceback with no way back short of finding and deleting the file
+        (AUDIT BUG 92). Everything unusable is ignored instead.
+        """
+        value = self.settings.value("hidden_columns")
+        if isinstance(value, (str, bytes)):
+            # Some Qt backends return a one-element list as a bare string.
+            value = str(value, "utf-8", "replace") if isinstance(value, bytes) else value
+            value = [part for part in value.split(",") if part.strip()]
+        if not isinstance(value, (list, tuple)):
+            return []
+        columns = []
+        for item in value:
+            try:
+                index = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(COLUMNS) and index not in columns:
+                columns.append(index)
+        # Every column hidden is a window that looks broken, with no visible way back. It is
+        # never what a restore should do, whatever the file says.
+        return [] if len(columns) >= len(COLUMNS) else columns
+
+    def _saved_views_setting(self) -> dict:
+        """The saved views, or none, if the setting is not the shape this program writes.
+
+        A string where the dictionary belongs turned the Views menu into one entry per
+        character, and picking one raised out of the handler (AUDIT BUG 92).
+        """
+        value = self.settings.value("saved_views")
+        if not isinstance(value, dict):
+            return {}
+        return {name: view for name, view in value.items()
+                if isinstance(name, str) and isinstance(view, dict)}
+
     def _restore_state(self):
         geometry = self.settings.value("geometry")
         if geometry:
@@ -283,11 +337,9 @@ class MainWindow(QMainWindow):
         self.header_restored = bool(state)
         if state:
             self.table.horizontalHeader().restoreState(state)
-        hidden = self.settings.value("hidden_columns") or []
-        for c in (int(x) for x in hidden):
-            if 0 <= c < len(COLUMNS):
-                self.table.setColumnHidden(c, True)
-                self.column_actions[c].setChecked(False)
+        for c in self._hidden_columns_setting():
+            self.table.setColumnHidden(c, True)
+            self.column_actions[c].setChecked(False)
 
     def closeEvent(self, event):
         self.settings.setValue("geometry", self.saveGeometry())
@@ -322,11 +374,22 @@ class MainWindow(QMainWindow):
             self._tag_selected()
 
     def _row_text(self, proxy_row):
+        """One row as tab-separated text, for the clipboard.
+
+        Every cell is escaped, because a tab or a newline INSIDE a value silently rearranges
+        whatever the analyst pastes into: a note typed over two lines split one row into two,
+        and a tab in a filename added a column, misaligning every column after it (AUDIT BUG
+        110). `escape_deceptive` already renders anything below U+0020 visibly, which is the
+        same rule this program applies to every other hostile string - so a value that contained
+        a tab still says so, rather than quietly becoming a different row.
+        """
         return "\t".join(
-            str(self.proxy.index(proxy_row, c).data() or "") for c in range(len(COLUMNS)))
+            escape_deceptive(str(self.proxy.index(proxy_row, c).data() or ""))
+            for c in range(len(COLUMNS)))
 
     # -- data --------------------------------------------------------------
     def load(self, paths):
+        self.loaded_paths = list(paths)
         # A path that does not exist, and a folder that is genuinely empty, used to produce the
         # same "nothing found" warning - so a typo or an unmounted share read as a completed
         # scan. Only one of those is evidence. Refuse the unusable paths by name before any of
@@ -390,9 +453,27 @@ class MainWindow(QMainWindow):
         progress.setValue(len(files))
         if not rows:
             return
+        # An analyst tags rows and writes notes, then re-scans the folder - to pick up a file
+        # copied in since, or simply by opening it again. Rebuilding the rows threw every tag
+        # and every note away without a word: the one piece of analyst-authored data in the
+        # tool, silently destroyed by the most ordinary action there is (AUDIT BUG 91). A tag
+        # describes a FILE, not a row, so it is carried across by source path.
+        for row in self.model.rows:
+            if row.get("tag") or row.get("note"):
+                self._annotations[row.get("source_path", "")] = (row.get("tag", ""),
+                                                                 row.get("note", ""))
+        restored = 0
+        for row in rows:
+            remembered = self._annotations.get(row.get("source_path", ""))
+            if remembered:
+                row["tag"], row["note"] = remembered
+                restored += 1
         self.model.beginResetModel()
         self.model.rows = rows
         self.model.endResetModel()
+        if restored:
+            self.statusBar().showMessage(
+                f"{restored} tag(s) and note(s) carried over from the previous scan", 8000)
         self.proxy.clear_filters()
         self._fit_columns()
         QApplication.processEvents()
@@ -436,6 +517,10 @@ class MainWindow(QMainWindow):
                     found += scan_folder(p, progress=tick)
         finally:
             busy.close()
+        # Kept so the window's contents can be EXPORTED. Until Round 45 the folder's artifacts
+        # existed on screen and nowhere else - an analyst could read 10,118 SuperFetch paths
+        # and had no way to put them in a report (AUDIT BUG 80).
+        self._artifacts = found
         if not found:
             self.detail_artifacts.setPlainText("No non-.pf artifacts found in the folder(s).")
             return
@@ -443,28 +528,21 @@ class MainWindow(QMainWindow):
                   "They carry no run times.\n"]
         # The CLI reports this under `pfcli artifacts`; leaving it out here meant the two
         # surfaces of one tool answered "what volume is HarddiskVolume3?" differently.
-        from prefetch_core.artifacts import correlate_volumes
-        identities = correlate_volumes(found)
-        if identities:
-            ident = ["Volume identity (correlated across artifacts, inferred):"]
-            for row in identities:
-                ident.append(f"    {row['drive_letter']} = {row['device']}")
-                ident.append(f"        {row['shared_paths']:,} shared paths — "
-                             f"{row['match']}% of {row['drive_letter']} paths, "
-                             f"next best device {row['next_best']}%")
-                if row.get("volume_serial"):
-                    created = row.get("volume_created")
-                    ident.append(f"        serial {row['volume_serial']}" + (
-                        f", volume created {created:%Y-%m-%d %H:%M:%S} UTC" if created else ""))
-            ident.append("    Derived by correlation, not read from any file.")
+        from prefetch_core.artifacts import correlate_volumes, describe_identities
+        withheld = []
+        ident = describe_identities(correlate_volumes(found, withheld), withheld)
+        if ident:
             blocks.append("\n".join(ident))
         for a in found:
             stamp = a.modified.strftime("%Y-%m-%d %H:%M") if a.modified else "-"
-            block = [f"{a.name}   [{a.kind}]   {a.size:,} bytes   modified {stamp}"]
+            # Escaped like every other name shown here: an artifact's file name is chosen by
+            # whoever wrote it, and it need not be valid text at all (AUDIT BUG 102).
+            block = [f"{escape_deceptive(a.name)}   [{a.kind}]   {a.size:,} bytes   "
+                     f"modified {stamp}"]
             block += [f"    {k:22} {v}" for k, v in a.facts.items()]
             if a.paths:
                 block.append(f"    {'paths':22} {len(a.paths)}")
-                block += [f"        {p}" for p in a.paths[:200]]
+                block += [f"        {escape_deceptive(p)}" for p in a.paths[:200]]
                 if len(a.paths) > 200:
                     block.append(f"        … {len(a.paths) - 200} more")
             if a.io_by_path:
@@ -581,19 +659,59 @@ class MainWindow(QMainWindow):
                 "Every column is hidden, so the export would contain no data.\n"
                 "Show at least one column (Columns menu) and try again.")
             return
+        widths = CellWidths()
         try:
-            with open(path, "w", newline="", encoding="utf-8") as fh:
+            with atomic_write(path) as fh:
                 w = csv.writer(fh)
                 w.writerow([COLUMNS[c][0] for c in visible])
                 for r in range(self.proxy.rowCount()):
-                    w.writerow([str(self.proxy.index(r, c).data() or "") for c in visible])
+                    cells = [str(self.proxy.index(r, c).data() or "") for c in visible]
+                    widths.note({COLUMNS[c][0]: cells[i] for i, c in enumerate(visible)})
+                    w.writerow(cells)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        # A spreadsheet truncates an over-long cell silently, so the dialog says so here rather
+        # than letting the analyst find a short list that looks complete (AUDIT BUG 74).
+        QMessageBox.information(
+            self, "Export",
+            f"Wrote {self.proxy.rowCount()} row(s) and {len(visible)} column(s)\n"
+            f"(the current filtered view, not the whole set)."
+            + (f"\n\n{widths.message}" if widths.message else ""))
+
+    def _export_artifacts(self):
+        """Write the folder's artifacts to a CSV pair, the same export `pfcli artifacts` writes.
+
+        Scans if the artifacts window has not been opened yet, so the action means the same
+        thing whether or not the analyst happened to look at the window first.
+        """
+        if not getattr(self, "_artifacts", None):
+            if not self.loaded_paths:
+                QMessageBox.information(self, "No folder loaded",
+                                        "Open a Prefetch folder first.")
+                return
+            self._load_artifacts(self.loaded_paths)
+        if not self._artifacts:
+            QMessageBox.information(
+                self, "Nothing to export",
+                "This folder holds no non-.pf artifacts. That is a result, not an error:\n"
+                "the folder was scanned and nothing else was in it.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export folder artifacts", "artifacts.csv",
+                                              "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            rows, summary, note = write_artifact_csv(self._artifacts, path)
         except OSError as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
         QMessageBox.information(
             self, "Export",
-            f"Wrote {self.proxy.rowCount()} row(s) and {len(visible)} column(s)\n"
-            f"(the current filtered view, not the whole set).")
+            f"Wrote {rows:,} path row(s) from {len(self._artifacts)} artifact(s).\n"
+            f"Facts, volume records and problems are in {os.path.basename(summary)}.\n\n"
+            f"These record file ACCESS and prefetcher priority, not execution."
+            + (f"\n\n{note}" if note else ""))
 
     def _export_tagged(self):
         tagged = [r for r in self.model.rows if r.get("tag")]
@@ -610,16 +728,26 @@ class MainWindow(QMainWindow):
         # should not silently inherit a display preference. `Export current view` is the
         # opposite by design: it reproduces exactly what is on screen.
         keys = [k for _label, k in COLUMNS] + ["note", "source_path"]
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=keys)
-            w.writeheader()
-            for r in tagged:
-                w.writerow({k: r.get(k, "") for k in keys})
+        # Same two rules as the view export, which this used to lack entirely: the write is
+        # atomic, and a failure is reported rather than raised out of a Qt slot (BUG 66/68).
+        widths = CellWidths()
+        try:
+            with atomic_write(path) as fh:
+                w = csv.DictWriter(fh, fieldnames=keys)
+                w.writeheader()
+                for r in tagged:
+                    cells = {k: r.get(k, "") for k in keys}
+                    widths.note(cells)
+                    w.writerow(cells)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
         QMessageBox.information(
             self, "Export",
             f"Wrote {len(tagged)} tagged row(s) with all {len(keys)} columns.\n"
             f"(Tagged exports are complete; hidden columns are still included. "
-            f"Use 'Export current view' to export exactly what is on screen.)")
+            f"Use 'Export current view' to export exactly what is on screen.)"
+            + (f"\n\n{widths.message}" if widths.message else ""))
 
     # -- detail pane -------------------------------------------------------
     @staticmethod
@@ -752,20 +880,55 @@ class MainWindow(QMainWindow):
         self.detail_volumes.set_rows(volume_rows)
 
         by_index = {m.index: m for m in pf.metrics}
+
+        def metric(i, attr, default=""):
+            m = by_index.get(i)
+            value = getattr(m, attr, None) if m else None
+            return default if value is None else value
+
         self.detail_files.set_rows([
             [i, name,
              by_index[i].mft_ref.entry if i in by_index and by_index[i].mft_ref else "",
-             by_index[i].mft_ref.sequence if i in by_index and by_index[i].mft_ref else ""]
+             by_index[i].mft_ref.sequence if i in by_index and by_index[i].mft_ref else "",
+             metric(i, "chain_count"), metric(i, "chain_subset"),
+             f"0x{by_index[i].flags:04x}" if i in by_index else ""]
             for i, name in enumerate(pf.filenames)])
+
+
+USAGE = """usage: pfgui [FOLDER|FILE ...]
+
+Open the prefetch explorer. Any paths given are loaded at startup; a folder is scanned for
+`.pf` files and for the other artifacts a Prefetch folder holds.
+
+  -h, --help    print this and exit
+
+The CLI is `pfcli` (parse / info / artifacts / ads / capabilities) and is the scriptable half:
+this program is for looking, filtering and tagging."""
 
 
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
+    # The GUI prints too - --help, the self-test, and every warning that reaches a console -
+    # and a redirected stream on Windows is the ANSI code page (AUDIT BUG 97).
+    make_stdio_safe()
+    # Before QApplication, and before anything opens a window: a frozen `pfgui --help` used to
+    # start the event loop and hang forever on a headless machine, because --help was taken for
+    # a path to load. A program that cannot say what it is is a bad program, and one that hangs
+    # instead of answering is worse.
+    if any(arg in ("-h", "--help") for arg in argv[1:]):
+        print(USAGE)
+        return 0
     app = QApplication(argv[:1])
     win = MainWindow()
     win.show()
     if len(argv) > 1:
         win.load(argv[1:])
+    if os.environ.get("PREFETCH_GUI_SELFTEST"):
+        # Build everything, pump the event queue once, and exit. A frozen bundle that is
+        # missing a Qt plugin fails here rather than in front of a user, and unlike `--help`
+        # this actually starts Qt - which is the half of the smoke test that matters.
+        app.processEvents()
+        return 0
     return app.exec()
 
 

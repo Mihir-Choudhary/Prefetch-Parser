@@ -23,6 +23,9 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import corpus  # noqa: E402
 
+SEED = os.path.join(corpus.WIN10, "7ZFM.EXE-7C92DCA0.pf")
+SEED_EXE = "7ZFM.EXE"
+
 GUI_ONLY = {"PySide6", "shiboken6"}
 CLI_ONLY = {"argparse"}
 
@@ -50,12 +53,18 @@ def package_imports(package):
 
 
 def check(label, ok, detail=""):
+    # A condition, not a value: this directory has both conventions, and passing a value here
+    # inverts the check silently (Round 48).
+    if not isinstance(ok, bool):
+        raise TypeError(f"check({label!r}) needs a condition, got {type(ok).__name__} {ok!r}")
     print(f"  {label:56} {'ok' if ok else 'FAIL'}{'  ' + detail if not ok else ''}")
     if not ok:
         failures.append(f"{label} {detail}")
 
 
 def main():
+    corpus.require("WIN10")
+    corpus.require_seed(SEED)
     core = package_imports("prefetch_core")
     cli = package_imports("pfcli")
     gui = package_imports("pfgui")
@@ -84,11 +93,17 @@ def main():
         "from prefetch_core.store import Store;"
         "from prefetch_core.artifacts import scan_folder;"
         "pf=prefetch_core.parse_file(%r);"
-        "print('OK', pf.executable_name)"
-    ) % (ROOT, "" + corpus.WIN10 + "/7ZFM.EXE-7C92DCA0.pf")
+        "print('OK' if pf.parsed_ok else 'FAILED', pf.executable_name, pf.failed_stage)"
+    ) % (ROOT, SEED)
     r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
-    check("core parses a file with PySide6 poisoned", r.returncode == 0 and "OK" in r.stdout,
-          r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "")
+    # Assert the parse SUCCEEDED, not merely that the probe exited cleanly. parse_file returns
+    # a failed record rather than raising (D10), so `returncode == 0 and "OK" in stdout` was
+    # satisfied by a file that did not exist: the probe printed "OK " with an empty name and
+    # this check went green while nothing had been parsed.
+    check("core parses a file with PySide6 poisoned",
+          r.returncode == 0 and r.stdout.split() == ["OK", SEED_EXE, "None"],
+          (r.stdout.strip() + " " + r.stderr.strip()).strip().splitlines()[-1]
+          if (r.stdout.strip() or r.stderr.strip()) else "")
 
     print("\nfrozen-build guards:")
     for module in ("pfcli/__main__.py", "pfgui/__main__.py"):

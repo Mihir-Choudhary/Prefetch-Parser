@@ -20,6 +20,7 @@ Run:  python3 fuzz_parser.py
 
 import glob
 import os
+import shutil
 import random
 import struct
 import sys
@@ -30,7 +31,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import corpus  # noqa: E402
 
-from prefetch_core import parse  # noqa: E402
+from prefetch_core import parse, parse_file  # noqa: E402
 from prefetch_core.container import is_container  # noqa: E402
 from prefetch_core import container as container_mod  # noqa: E402
 
@@ -111,6 +112,8 @@ def mutations(name, body):
 
 
 def main():
+    # The vendored files are uncompressed; only the real corpora exercise MAM containers.
+    corpus.require("WIN10")
     seeds = decompressed_seeds()
     if not seeds:
         print("!! no seed files found", file=sys.stderr)
@@ -162,6 +165,140 @@ def main():
         for it in items[:10]:
             print(f"   {title}: {it[0]} [{it[1]}] {it[2]}")
 
+    # A planted file far larger than any real prefetch must cost one row, not the run. The
+    # released build read it whole and died with MemoryError, taking every other record with it
+    # (AUDIT BUG 77). The file here is sparse, so it costs 4 KB of disk to test 4 GB of claim.
+    print("\na planted oversize file costs one row, not the run:")
+    import subprocess as _sp                                          # noqa: PLC0415
+    import tempfile as _tempfile                                      # noqa: PLC0415
+
+    from prefetch_core import limits as _limits                       # noqa: PLC0415
+
+    folder = _tempfile.mkdtemp()
+    import glob as _glob                                              # noqa: PLC0415
+    real = sorted(_glob.glob(os.path.join(corpus.WIN10, "*.pf")))[0]
+    shutil.copyfile(real, os.path.join(folder, os.path.basename(real)))
+    huge = os.path.join(folder, "HUGE.EXE-DEADBEEF.pf")
+    with open(huge, "wb") as fh:
+        fh.write(b"\x1e\x00\x00\x00SCCA")
+        fh.truncate(_limits.MAX_PREFETCH_BYTES * 4)
+    record = parse_file(huge)
+    over_ok = (not record.parsed_ok and record.failed_stage == "read"
+               and any("ceiling" in str(p) for p in record.problems))
+    print(f"  the oversize file becomes a failed record that says why: {over_ok}")
+    run = _sp.run([sys.executable, "-m", "pfcli", "parse", folder],
+                  cwd=os.path.dirname(HERE), capture_output=True, text=True, timeout=300)
+    # The summary line goes to stderr; the rows go to stdout. Check both, and check the run
+    # did not die on the way (the released build ended in a MemoryError traceback).
+    output = run.stdout + run.stderr
+    survived = ("2 file(s), 1 failed to parse" in output and "MemoryError" not in output
+                and "Traceback" not in output)
+    print(f"  the rest of the folder still parses: {survived}")
+    ok_oversize = over_ok and survived
+
+    # Round 46. A collected Prefetch folder does not only contain files. A FIFO left by a
+    # collection script, a device node from a mounted image, something planted: `st_size` lies
+    # about every one of them - /dev/zero reports 0 - so the ceiling above passed and the read
+    # that followed was UNBOUNDED. The process grew until the OS killed it: no row, no exit
+    # code, no report, and the analyst's session gone with it (AUDIT BUG 96). Opening a FIFO
+    # never gets that far - it blocks forever waiting for a writer, and the scan hangs.
+    #
+    # Run under a hard 512 MB address-space cap in a subprocess: a regression here must fail
+    # this check, not take the machine down with it.
+    print("\n  a folder that contains things which are not files:")
+    # The hazard is the same on both platforms - a path that is not an ordinary file, whose
+    # size says nothing about how much it will read - but nothing about how to *create* one is
+    # portable. POSIX: a FIFO and a symlink to /dev/zero. Windows: `os.mkfifo` does not exist,
+    # /dev/zero does not exist, and `os.symlink` needs Developer Mode or elevation - but the
+    # reserved device names do the job better, because `C:\...\NUL.pf` IS a character device to
+    # every Win32 API, needs no privilege, and is exactly what a collected folder can contain.
+    # A probe that raises AttributeError on its first Windows run would report a defect that is
+    # nothing but a platform difference.
+    probe = r"""
+import os, sys, tempfile
+if os.name != "nt":
+    import resource
+    resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024,) * 2)
+sys.path.insert(0, %r)
+from prefetch_core import parse_file
+from prefetch_core.artifacts import scan_folder
+
+work = tempfile.mkdtemp()
+if os.name == "nt":
+    # A reserved device name resolves to the device wherever it appears, extension and all, so
+    # `NUL.pf` needs no privilege to "create" and is exactly what a collected folder can hold.
+    pf_path = os.path.join(work, "NUL.pf")
+    expected = {"PfPre_CON.mkd": "character device"}
+else:
+    os.mkfifo(os.path.join(work, "PfPre_fifo.mkd"))
+    os.symlink("/dev/zero", os.path.join(work, "Trace9.fx"))
+    os.symlink("/dev/zero", os.path.join(work, "ZERO.EXE-DEADBEEF.pf"))
+    pf_path = os.path.join(work, "ZERO.EXE-DEADBEEF.pf")
+    expected = {"PfPre_fifo.mkd": "FIFO", "Trace9.fx": "character device"}
+
+rec = parse_file(pf_path)
+assert not rec.parsed_ok and rec.failed_stage == "read", rec.failed_stage
+assert any("not a regular file" in str(p) for p in rec.problems), rec.problems
+
+found = {a.name: [str(p) for p in a.problems] for a in scan_folder(work)}
+for name, want in expected.items():
+    if os.name == "nt" and name not in found:
+        continue          # a device name cannot always be listed as a directory entry
+    assert name in found and want in found[name][0], (name, found)
+print("OK")
+""" % (os.path.dirname(HERE),)
+    devnodes = _sp.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=120)
+    nodes_ok = devnodes.returncode == 0 and "OK" in devnodes.stdout
+    print(f"    a FIFO and a device node are reported, not read: {nodes_ok}")
+    if not nodes_ok:
+        print("    !! " + (devnodes.stderr.strip().splitlines() or ["no output"])[-1][:200])
+
+    # Round 48. `container.decompress()` is public, and for a malformed stream it let the pure
+    # decoder's own exception type escape - an exception from an internal module that no
+    # documented contract mentions, so a crafted container could reach a caller as something
+    # other than the one error type this package promises (AUDIT BUG 104). `parse_file` was
+    # never affected: it goes through `load()`, which converted it. The boundary now does.
+    print("\n  the public container API raises only PrefetchError:")
+    import struct as _struct                                          # noqa: PLC0415
+
+    from prefetch_core import container as _container                 # noqa: PLC0415
+    from prefetch_core.errors import PrefetchError as _PrefetchError   # noqa: PLC0415
+
+    mam = None
+    import glob as _glob2                                             # noqa: PLC0415
+    for candidate in sorted(_glob2.glob(os.path.join(corpus.WIN10, "*.pf"))):
+        with open(candidate, "rb") as fh:
+            blob = fh.read()
+        if blob[:3] == b"MAM":
+            mam = blob
+            break
+    escapes = []
+    if mam:
+        cases = {"a declared size the stream cannot fill": 64 * 1024 * 1024,
+                 "a declared size of zero": 0,
+                 "one byte more than the stream holds": None}
+        for label, declared in cases.items():
+            crafted = bytearray(mam)
+            if declared is None:
+                declared = _struct.unpack_from("<I", crafted, 4)[0] + 1
+            _struct.pack_into("<I", crafted, 4, declared)
+            try:
+                _container.decompress(bytes(crafted), prefer="pure")
+            except _PrefetchError:
+                pass
+            except Exception as exc:                                  # noqa: BLE001
+                escapes.append(f"{label}: {type(exc).__name__}")
+        # ...and the same through the wrapper, which callers use.
+        for cut in (12, 40, len(mam) // 2):
+            try:
+                _container.load(mam[:cut], prefer="pure")
+            except _PrefetchError:
+                pass
+            except Exception as exc:                                  # noqa: BLE001
+                escapes.append(f"load(truncated at {cut}): {type(exc).__name__}")
+    print(f"    exceptions escaping the container API: {escapes or 'none'}")
+    container_ok = not escapes and mam is not None
+
     # A harness that stops reaching the deep stages still reports a clean pass, which is how a
     # regression hides. Assert the mutations actually drive failures through every stage.
     want_stages = {"container", "signature", "fileinfo", "metrics",
@@ -171,7 +308,8 @@ def main():
     if missing:
         print(f"   !! no mutation reached: {sorted(missing)} - the harness has gone weak")
 
-    ok = not (crashes or slow or garbage or missing)
+    ok = (not (crashes or slow or garbage or missing) and ok_oversize and nodes_ok
+          and container_ok)
     print("\nPASS - no crashes, no hangs, no unflagged nonsense" if ok else "\nFAIL")
     return 0 if ok else 1
 

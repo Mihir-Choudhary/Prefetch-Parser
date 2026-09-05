@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sqlite3
 import sys
 
 # Allow running from a source checkout without installing. Skipped when frozen: PyInstaller
@@ -22,57 +23,14 @@ import sys
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from prefetch_core import available_decompressors, parse_file  # noqa: E402
+from prefetch_core import available_decompressors, parse_file, winpath  # noqa: E402
+# The list encoding, the formula guard and the artifact writer live in the core: the GUI
+# needs them too, and two implementations of one export is how they come to disagree.
+from prefetch_core.export import (  # noqa: E402
+    ESCAPE, FORMULA_TRIGGERS, LIST_SEP, join_list, sanitize_cell, split_list,
+    write_artifact_csv)
+from prefetch_core.output import CellWidths, atomic_write, make_stdio_safe  # noqa: E402
 from prefetch_core.store import Store, StoreError  # noqa: E402
-
-LIST_SEP = " | "
-ESCAPE = "^"
-
-
-def join_list(values):
-    """Join list-valued CSV cells, escaping any literal separator inside an element.
-
-    CSV quoting protects the *field*, not the list inside it: an element containing " | "
-    silently becomes two elements when anyone splits the cell back apart. No path in the
-    107,064 strings across both corpora contains one - but Win32 forbidding `|` in filenames
-    does not bind the kernel namespace that prefetch records, so a file can be created with
-    native APIs whose name carries the separator. That turns a display convention into a way to
-    inject extra rows into forensic output, which is worth closing even at zero observed
-    occurrences.
-
-    The escape character is `^`, not backslash. Backslash is the obvious choice and it is wrong
-    here: every element is a Windows path, so escaping backslashes would double them throughout
-    and wreck readability, while escaping *only* `\\|` is not self-inverse - a path that already
-    contains `\\|` then decodes differently from how it was encoded. `^` is legal in filenames
-    so it still has to be escaped, but it is rare enough that real output is unaffected.
-
-        ^  ->  ^^        |  ->  ^p
-    """
-    return LIST_SEP.join(
-        str(v).replace(ESCAPE, ESCAPE * 2).replace("|", ESCAPE + "p") for v in values)
-
-
-def split_list(cell):
-    """Inverse of `join_list`, for anything reading our CSV back."""
-    parts, current, i = [], [], 0
-    while i < len(cell):
-        if cell.startswith(ESCAPE * 2, i):
-            current.append(ESCAPE)
-            i += 2
-        elif cell.startswith(ESCAPE + "p", i):
-            current.append("|")
-            i += 2
-        elif cell.startswith(LIST_SEP, i):
-            parts.append("".join(current))
-            current = []
-            i += len(LIST_SEP)
-        else:
-            current.append(cell[i])
-            i += 1
-    if current or parts:
-        parts.append("".join(current))
-    return parts
-
 
 # Superset of PECmd's columns. Every column it emits has an equivalent here, plus the fields
 # it drops. Two of its shapes are deliberately not copied:
@@ -89,6 +47,23 @@ CSV_COLUMNS = [
     "Volume1Name", "Volume1Serial", "Volume1Created", "AllVolumes",
     "Directories", "DirectoryCount", "FilesLoaded", "FileCount", "TraceChains",
     "NameTruncated", "IsOpFile", "DeceptiveChars", "ParsedOk", "FailedStage", "Problems",
+    # The volume self-check verdict, the references the file does not declare, and the
+    # directory count the file states beside the one actually recovered. All three were in the
+    # database and none of them in the export.
+    "FilenameHashMatch", "FilenameNameMatch", "ContainerTrailingBytes", "Decompressor",
+    "VolumeNameChecks", "SlackReferences", "SlackReferenceCount", "DeclaredDirectoryCount",
+    "DeclaredReferenceCount", "ReferenceCount",
+    # Bytes in the file that belong to no field of it - residue of an earlier version of the
+    # same record. Summary here; every region is in the `residue` table of the database.
+    "ResidueBytes", "ResidueText",
+    # Where the record came from when it was not a file in a Prefetch folder, and whose
+    # timestamps the row above is carrying (AUDIT BUG 72).
+    "FromAds", "CarrierPath", "StreamName", "StreamSize", "TimestampSource",
+    "CarrierCreated", "CarrierModified", "CarrierAccessed", "CarrierIsPrefetch",
+    "OutsidePrefetchFolder",
+    # created - 10s, the documented approximation of the first execution. Shown in the GUI and
+    # in `info`; absent from the export until now.
+    "FirstRunApprox",
 ]
 
 
@@ -136,38 +111,28 @@ def _walk(paths, recurse):
 # Characters that make a spreadsheet treat a cell as a formula rather than text. A path named
 # `=cmd|'/c calc'!A1` is executed by Excel on open - the classic DDE/CSV-injection payload.
 # Forensic CSVs are opened in Excel more or less always, and the filename is attacker-chosen.
-FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
-
-
-def sanitize_cell(value, enabled=True):
-    """Neutralise spreadsheet formula triggers by prefixing the cell with an apostrophe.
-
-    Excel treats a leading `'` as "this is text" and does not display it. Other readers see it
-    as part of the value, which is why `--raw-csv` exists: fidelity for programmatic consumers,
-    safety by default for the spreadsheet that will actually open this.
-
-    The SQLite store is never sanitised - it is the source of truth and holds exact bytes.
-
-    Zero of the 108,972 strings in both corpora begin with a trigger, so this changes nothing
-    about real output.
-    """
-    text = "" if value is None else str(value)
-    if not enabled or text[:1] not in FORMULA_TRIGGERS:
-        return text
-    # A leading "-" is a formula trigger AND the start of every negative number. Prefixing
-    # those turns -1 into the string '-1: a spreadsheet shows it as text and a programmatic
-    # reader gets a stray apostrophe. Real negatives occur - v17 stores TotalDirectoryCount as
-    # -1, and a corrupt file can yield negative counts - so a value that is simply a number is
-    # left exactly as it is. It cannot be a formula.
-    try:
-        float(text)
-        return text
-    except ValueError:
-        return "'" + text
-
-
 def _ts(dt):
     return dt.isoformat(sep=" ") if dt else ""
+
+
+def _name(path: str) -> str:
+    """A file's name as the console should show it - the same rendering the exports use.
+
+    Without this the console printed the code point Python uses for a byte it could not decode
+    while the CSV and the database printed the byte itself: one file,
+    two spellings, across three surfaces of one tool (AUDIT BUG 102).
+    """
+    return winpath.readable_text(os.path.basename(path or ""))
+
+
+def _shown(text: str) -> str:
+    """The same rendering for a whole path or any other string headed for the console."""
+    return winpath.readable_text(text or "")
+
+
+def _tri(value):
+    """Three states, never two - the same convention the database uses."""
+    return "n/a" if value is None else ("ok" if value else "mismatch")
 
 
 def row_for(pf):
@@ -210,6 +175,53 @@ def row_for(pf):
         "ParsedOk": int(pf.parsed_ok),
         "FailedStage": pf.failed_stage or "",
         "Problems": join_list(str(p) for p in pf.problems),
+        # Volumes state their own creation time and serial inside the \VOLUME{...} name; the
+        # parser checks that against the fields and this is the verdict, per volume. It was in
+        # the database and in the GUI but not in the export anyone actually reads.
+        # Bytes carried after the end of the compressed stream: empty means "not measured".
+        "ContainerTrailingBytes": ("" if pf.container_trailing_bytes is None
+                                   else pf.container_trailing_bytes),
+        "Decompressor": pf.decompressor_used,
+        # The filename against the header: renamed or planted files say so here.
+        "FilenameHashMatch": _tri(pf.filename_hash_match),
+        "FilenameNameMatch": _tri(pf.filename_name_match),
+        "VolumeNameChecks": join_list(
+            "n/a" if v.name_self_check is None else ("ok" if v.name_self_check else "mismatch")
+            for v in pf.volumes),
+        # References found in the array past the count the file declares - evidence the file
+        # does not claim. In the database since Round 42, in the CSV only now.
+        "SlackReferences": join_list(
+            f"[vol{j}] {r}" for j, v in enumerate(pf.volumes) for r in v.slack_refs),
+        "SlackReferenceCount": sum(len(v.slack_refs) for v in pf.volumes),
+        # The count the file declares, beside the number actually recovered above. A
+        # disagreement is a finding, and averaging them away would hide it.
+        "DeclaredDirectoryCount": "" if pf.total_directory_count is None else pf.total_directory_count,
+        # Slots the reference arrays declare, against the ones that actually hold a reference.
+        "DeclaredReferenceCount": sum(v.declared_ref_count for v in pf.volumes),
+        "ReferenceCount": sum(len(v.file_refs) for v in pf.volumes),
+        "ResidueBytes": pf.residue_bytes,
+        # Only the fragments that read as text; the raw bytes of every region are in the
+        # database, and `pfcli info` shows them per region.
+        "ResidueText": join_list(r.text for r in pf.residue if r.text),
+        # Provenance for a record recovered from an alternate data stream. Without it the row
+        # sits in the same columns as an ordinary one while carrying the CARRIER's timestamps,
+        # with nothing to say so (AUDIT BUG 72). Empty for ordinary records: not applicable is
+        # not the same as false.
+        "FromAds": int(pf.from_ads),
+        "CarrierPath": pf.carrier_path or "",
+        "StreamName": pf.stream_name or "",
+        "StreamSize": pf.stream_size if pf.from_ads else "",
+        # Written for EVERY record, not only the ADS ones. The model's default is "stream" -
+        # the measured fact that an ordinary file's timestamps are its own - and blanking it
+        # replaced that with the convention this codebase uses for *not measured*. An analyst
+        # filtering for records whose times can be trusted got nothing at all (AUDIT BUG 106).
+        "TimestampSource": pf.timestamp_source,
+        "CarrierCreated": _ts(pf.carrier_created),
+        "CarrierModified": _ts(pf.carrier_modified),
+        "CarrierAccessed": _ts(pf.carrier_accessed),
+        "CarrierIsPrefetch": int(pf.carrier_is_prefetch) if pf.from_ads else "",
+        "OutsidePrefetchFolder": int(pf.outside_prefetch_folder) if pf.from_ads else "",
+        "FirstRunApprox": _ts(pf.first_run_approx),
     }
     for i in range(7):
         row[f"PreviousRun{i}"] = _ts(previous[i]) if i < len(previous) else ""
@@ -218,7 +230,10 @@ def row_for(pf):
         row[f"Volume{j}Name"] = v.device_name if v else ""
         row[f"Volume{j}Serial"] = v.serial if v else ""
         row[f"Volume{j}Created"] = _ts(v.created) if v else ""
-    return row
+    # A filename does not have to be valid text, and the two exports must not spell one name
+    # two ways: the database renders undecodable bytes through the same function (AUDIT BUG
+    # 102). Applied here rather than per column, so a column added later cannot forget.
+    return {k: winpath.readable_text(v) if isinstance(v, str) else v for k, v in row.items()}
 
 
 def cmd_parse(args):
@@ -259,25 +274,77 @@ def cmd_parse(args):
         try:
             with Store(args.db) as s:
                 s.add_all(records)
-            print(f"wrote {len(records)} records to {args.db}")
-        except (StoreError, OSError) as exc:
+            # Diagnostics go to stderr, always: a script piping stdout for the rows used to
+            # get four lines of commentary mixed into its data (AUDIT BUG 107).
+            print(f"wrote {len(records)} records to {args.db}", file=sys.stderr)
+        # sqlite3.Error as well as StoreError: the store wraps what it can, and this is the
+        # last line before a traceback would discard a run that has already been parsed.
+        except (StoreError, OSError, sqlite3.Error) as exc:
             print(f"!! could not write database: {exc}", file=sys.stderr)
             write_errors += 1
 
     if args.csv:
         try:
             safe = not args.raw_csv
-            with open(args.csv, "w", newline="", encoding="utf-8") as fh:
+            # Atomic: a failure here must not destroy the CSV from the previous run.
+            widths = CellWidths()
+            guarded = {}
+            with atomic_write(args.csv) as fh:
                 w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
                 w.writeheader()
                 for pf in records:
                     # Sanitised at write time rather than inside row_for, so every column is
                     # covered automatically instead of only the ones anyone remembered.
-                    w.writerow({k: sanitize_cell(v, safe) for k, v in row_for(pf).items()})
-            print(f"wrote {len(records)} rows to {args.csv}")
+                    raw = row_for(pf)
+                    cells = {k: sanitize_cell(v, safe) for k, v in raw.items()}
+                    for key, value in cells.items():
+                        if isinstance(value, str) and value.startswith("'") \
+                                and str(raw[key] or "") != value:
+                            guarded[key] = guarded.get(key, 0) + 1
+                    widths.note(cells)
+                    w.writerow(cells)
+            print(f"wrote {len(records)} rows to {args.csv}", file=sys.stderr)
+            if widths.message:
+                print(widths.message, file=sys.stderr)
+            if guarded:
+                # An unexplained apostrophe in an export is its own trust problem: say which
+                # cells carry one and why, and name the flag that writes exact bytes.
+                columns = ", ".join(f"{name} ({count})" for name, count in sorted(guarded.items()))
+                print(f"note: {sum(guarded.values())} cell(s) were prefixed with an apostrophe "
+                      f"so a spreadsheet cannot re-read them as numbers or dates: {columns}. "
+                      f"The value follows the apostrophe unchanged; --raw-csv writes exact "
+                      f"bytes.", file=sys.stderr)
         except OSError as exc:
             print(f"!! could not write CSV {args.csv!r}: {exc}", file=sys.stderr)
             write_errors += 1
+
+    # A prefetch filename is derived from the executable name and a path hash, and the header
+    # holds both. A disagreement means renamed, copied or planted - too strong a signal to
+    # leave only in the CSV's Problems column, where a console user never sees it.
+    renamed = [pf for pf in records
+               if pf.filename_hash_match is False or pf.filename_name_match is False]
+    if renamed:
+        print(f"\n!! {len(renamed)} file(s) whose NAME disagrees with their own header "
+              f"(renamed, copied, or planted):", file=sys.stderr)
+        for pf in renamed[:20]:
+            print(f"   {_name(pf.source_path)}  header says "
+                  f"{pf.executable_name or '(none)'} / {pf.hash or '(none)'}", file=sys.stderr)
+        if len(renamed) > 20:
+            print(f"   ... and {len(renamed) - 20} more", file=sys.stderr)
+
+    # With `--csv` or `--db` the per-file table is not printed, and the run summary then said
+    # "8 failed to parse" without saying WHICH - the names were in the export and nowhere on
+    # the console. A failed record is the one thing an analyst wants to see immediately.
+    failed = [pf for pf in records if not pf.parsed_ok]
+    if failed and (args.db or args.csv):
+        print(f"\n{len(failed)} file(s) failed to parse:", file=sys.stderr)
+        for pf in failed[:20]:
+            reason = pf.problems[-1].message if pf.problems else "unknown"
+            print(f"   {_name(pf.source_path):<44} [{pf.failed_stage}] {reason}",
+                  file=sys.stderr)
+        if len(failed) > 20:
+            print(f"   ... and {len(failed) - 20} more (all of them are in the export)",
+                  file=sys.stderr)
 
     if not args.db and not args.csv:
         for pf in records:
@@ -285,7 +352,7 @@ def cmd_parse(args):
                 # A failed record has no executable name or hash, so printing the normal
                 # columns yields a blank line and the analyst cannot tell which file broke.
                 reason = pf.problems[-1].message if pf.problems else "unknown"
-                print(f"{'FAILED':<8}  {os.path.basename(pf.source_path):<44} "
+                print(f"{'FAILED':<8}  {_name(pf.source_path):<44} "
                       f"[{pf.failed_stage}] {reason}")
                 continue
             path = pf.executable_path or f"<{pf.path_source.value}>"
@@ -297,14 +364,16 @@ def cmd_parse(args):
     if records and all(r.source_created is None for r in records):
         print("note: this filesystem reports no creation time, so SourceCreated is empty and "
               "first-run estimates are unavailable", file=sys.stderr)
-    # Non-zero when an output could not be written, so a script does not treat a run that
-    # produced no file as success.
-    return 1 if write_errors else 0
+    # 120, not 1. `1` means "nothing was parsed"; this means "the evidence parsed and one of
+    # the outputs could not be written", which a script should be able to tell apart - and
+    # `artifacts` and `ads` already returned 120 for exactly this, so `parse` returning 1 made
+    # the same condition report two different codes depending on the subcommand (AUDIT BUG 82).
+    return 120 if write_errors else 0
 
 
 def cmd_info(args):
     pf = parse_file(args.path, prefer_decompressor=args.decompressor)
-    print(f"source          : {pf.source_path}")
+    print(f"source          : {_shown(pf.source_path)}")
     # Lead with the verdict. Everything below a failure was read from bytes that never passed
     # validation - the version in particular is taken before the signature is checked, so a
     # file that is not prefetch at all still shows a plausible-looking number. Printing that
@@ -329,14 +398,88 @@ def cmd_info(args):
     for j, v in enumerate(pf.volumes):
         print(f"volume {j}        : {v.device_name}")
         print(f"   serial {v.serial}  created {v.created}  name-check {v.name_self_check}")
-        print(f"   {len(v.directories)} directories, {len(v.file_refs)} MFT references")
+        slack = (f", {len(v.slack_refs)} unclaimed in array slack"
+                 if getattr(v, "slack_refs", None) else "")
+        print(f"   {len(v.directories)} directories, {len(v.file_refs)} MFT references{slack}")
+        for r in getattr(v, "slack_refs", []):
+            # Not counted by the file. Shown apart from the declared references so nothing
+            # reads them as part of what the record claims.
+            print(f"      slack reference: {r}")
     print(f"loaded files    : {len(pf.filenames)}")
+    if pf.metrics:
+        # Each metric owns a slice of the trace-chain array; the slices tile it exactly. That
+        # is what makes "how much block-load work did this file account for" answerable at all.
+        print(f"   trace chains   : {pf.trace_chain_count} entries, "
+              f"attributed to {len(pf.metrics)} file(s)")
+        print("   idx  chains  fetched  flags    file")
+        for m in pf.metrics[:20]:
+            ref = f"  mft {m.mft_ref}" if m.mft_ref else ""
+            subset = "-" if m.chain_subset is None else str(m.chain_subset)
+            # `filename[-60:]` cut the path from the LEFT, silently: the corpus printed
+            # `UME{01d8559f...}\WINDOWS\SYSTEM32\IMAGERES.DLL` - a path missing its first four
+            # characters, with nothing to say so, in the command whose whole purpose is to be
+            # complete. A truncated path in a report is a path that does not exist (AUDIT BUG
+            # 108). Printed whole; a long line wraps, which costs nothing an analyst minds.
+            print(f"   {m.index:>4}  {m.chain_count:>6}  {subset:>7}  "
+                  f"0x{m.flags:04x}  {_shown(m.filename)}{ref}")
+        if len(pf.metrics) > 20:
+            print(f"   … {len(pf.metrics) - 20} more (--db writes every one)")
+    if pf.residue:
+        print(f"residue         : {pf.residue_bytes} byte(s) in {len(pf.residue)} region(s) "
+              f"that belong to no field of this file")
+        for r in pf.residue:
+            shown = repr(r.text) if r.text else r.data[:24].hex(" ")
+            print(f"   +{r.offset:<8} {r.size:>4} bytes  {shown}")
+
+    undecoded = undecoded_fileinfo(pf)
+    if undecoded:
+        # Printed because they exist, not because they mean anything. Ten dwords of the
+        # file-information section are documented by nobody and are populated on real files;
+        # a tool that silently drops them is deciding on the analyst's behalf that they do not
+        # matter. Offsets are relative to the section start (absolute 84).
+        nonzero = [(off, val) for off, val in undecoded if val]
+        print(f"undecoded fields: {len(undecoded)} dword(s) in the file-information section "
+              f"that no published description names; {len(nonzero)} non-zero")
+        for off, val in nonzero:
+            print(f"   +{off:<4} 0x{val:08x}  {val}")
     if pf.problems:
         print("problems:")
         for p in pf.problems:
             print(f"   {p}")
     # Non-zero when the file did not parse, so `pfcli info x.pf && ...` behaves sensibly.
     return 1 if pf.failed_stage else 0
+
+
+def undecoded_fileinfo(pf):
+    """The dwords of the file-information section this parser can name nothing about.
+
+    Everything the format documentation describes is read into fields; this is the remainder,
+    returned as `(offset from section start, value)`. It exists so "we read the whole file" is
+    a checkable claim rather than a promise.
+    """
+    import struct as _struct
+
+    from prefetch_core.scca import LAYOUT
+
+    raw = getattr(pf, "fileinfo_raw", b"")
+    layout = LAYOUT.get(pf.version)
+    if not raw or layout is None:
+        return []
+    known = set(range(0, 32, 4))                       # the eight offset/count pairs
+    if layout.dir_count_offset is not None:
+        known.add(layout.dir_count_offset)
+    for i in range(layout.runtime_slots * 2):          # 8-byte FILETIMEs
+        known.add(layout.runtime_offset + i * 4)
+    runcount = layout.runcount_offset
+    if runcount is None:
+        runcount = len(raw) - 96
+    known.add(runcount)
+    out = []
+    for off in range(0, len(raw) - 3, 4):
+        if off in known:
+            continue
+        out.append((off, _struct.unpack_from("<I", raw, off)[0]))
+    return out
 
 
 def cmd_ads(args):
@@ -396,19 +539,42 @@ def cmd_ads(args):
         for problem in pf.problems:
             print(f"    ! {problem}")
 
+    write_errors = 0
     if args.db:
         try:
             with Store(args.db) as s:
                 s.add_all(records)
-            print(f"\nwrote {len(records)} record(s) to {args.db}")
-        except (StoreError, OSError) as exc:
+            print(f"\nwrote {len(records)} record(s) to {args.db}", file=sys.stderr)
+        except (StoreError, OSError, sqlite3.Error) as exc:
             print(f"!! could not write database: {exc}", file=sys.stderr)
-            return 1
+            write_errors += 1
+
+    # The CSV carries the carrier path, the stream name and whose timestamps the row holds, so
+    # an ADS finding can now be exported without losing the provenance that makes it evidence.
+    if args.csv:
+        try:
+            safe = not args.raw_csv
+            widths = CellWidths()
+            with atomic_write(args.csv) as fh:
+                w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+                w.writeheader()
+                for pf in records:
+                    cells = {k: sanitize_cell(v, safe) for k, v in row_for(pf).items()}
+                    widths.note(cells)
+                    w.writerow(cells)
+            print(f"wrote {len(records)} row(s) to {args.csv}", file=sys.stderr)
+            if widths.message:
+                print(widths.message, file=sys.stderr)
+        except OSError as exc:
+            print(f"!! could not write CSV {args.csv!r}: {exc}", file=sys.stderr)
+            write_errors += 1
 
     print(f"\n{len(findings)} prefetch file(s) recovered from alternate data streams.")
     print("Timestamps shown are the CARRIER's - a stream has none of its own, so "
           "first-run estimates are unavailable for these records.")
     report_skipped()
+    if write_errors:
+        return 120
     return 1 if skipped else 0
 
 
@@ -433,7 +599,7 @@ def cmd_artifacts(args):
         return 0
     for a in found:
         stamp = a.modified.strftime("%Y-%m-%d %H:%M") if a.modified else "-"
-        print(f"\n{a.name}   [{a.kind}]   {a.size:,} bytes   modified {stamp}")
+        print(f"\n{_shown(a.name)}   [{a.kind}]   {a.size:,} bytes   modified {stamp}")
         for k, v in a.facts.items():
             print(f"    {k:22} {v}")
         if a.paths:
@@ -455,29 +621,51 @@ def cmd_artifacts(args):
 
     # `\Device\HarddiskVolumeN` is what prefetch records; `C:` is what an analyst needs. This
     # is the one place in a collected folder where the two can be tied together.
-    from prefetch_core.artifacts import correlate_volumes
-    identities = correlate_volumes(found)
-    if identities:
-        print("\nVolume identity (correlated across artifacts, inferred):")
-        for row in identities:
-            print(f"    {row['drive_letter']} = {row['device']}")
-            print(f"        {row['shared_paths']:,} shared paths — {row['match']}% of "
-                  f"{row['drive_letter']} paths, next best device {row['next_best']}%")
-            if row.get("volume_serial"):
-                created = row.get("volume_created")
-                print(f"        serial {row['volume_serial']}"
-                      + (f", volume created {created:%Y-%m-%d %H:%M:%S} UTC" if created else ""))
-        print("    Derived by correlation, not read from any file. Volumes with no matching\n"
-              "    evidence are omitted rather than guessed.")
+    from prefetch_core.artifacts import correlate_volumes, describe_identities
+    # Rendered by prefetch_core, not here: the CLI and the GUI each had their own copy of this
+    # block and each printed a stated SuperFetch record as an inference (AUDIT BUG 88).
+    withheld = []
+    lines = describe_identities(correlate_volumes(found, withheld), withheld)
+    if lines:
+        print()
+        for line in lines:
+            print(line)
+
+    write_errors = 0
+    if args.db:
+        try:
+            with Store(args.db) as s:
+                s.add_artifacts(found)
+            print(f"\nwrote {len(found)} artifact(s) to {args.db}", file=sys.stderr)
+        except (StoreError, OSError, sqlite3.Error) as exc:
+            print(f"!! could not write database: {exc}", file=sys.stderr)
+            write_errors += 1
+
+    if args.csv:
+        try:
+            paths_written, summary_path, note = write_artifact_csv(
+                found, args.csv, safe=not args.raw_csv)
+            print(f"wrote {paths_written:,} path row(s) to {args.csv}", file=sys.stderr)
+            print(f"wrote {len(found)} artifact summary row(s) to {summary_path}",
+                  file=sys.stderr)
+            if note:
+                print(note, file=sys.stderr)
+        except OSError as exc:
+            print(f"!! could not write CSV {args.csv!r}: {exc}", file=sys.stderr)
+            write_errors += 1
 
     # These are access/priority artifacts. Saying so once, plainly, is cheaper than an analyst
     # reading a Layout.ini path as evidence that something executed.
     print(f"\n{len(found)} artifact(s). None of these record execution: they show files the "
           f"system treated as hot, with no run times.")
-    return 0
+    return 120 if write_errors else 0
 
 
 def main(argv=None):
+    # Before anything can print: on Windows a redirected stdout is the ANSI code page, and one
+    # Cyrillic filename in the folder ends the run with a UnicodeEncodeError traceback and no
+    # report (AUDIT BUG 97).
+    make_stdio_safe()
     ap = argparse.ArgumentParser(prog="pfcli", description="Windows Prefetch parser")
     ap.add_argument("--decompressor", choices=["ntdll", "pure"],
                     help="force a decompressor; default probes for ntdll and falls back")
@@ -500,6 +688,9 @@ def main(argv=None):
     p = sub.add_parser("ads", help="recover prefetch hidden in NTFS alternate data streams")
     p.add_argument("folder")
     p.add_argument("--db", help="write recovered records to a SQLite database")
+    p.add_argument("--csv", help="write recovered records to a CSV, provenance included")
+    p.add_argument("--raw-csv", action="store_true",
+                   help="do not prefix formula-trigger cells with an apostrophe")
     p.add_argument("--files-only", action="store_true",
                    help="skip directories; NTFS directory objects can carry streams too")
     p.set_defaults(func=cmd_ads)
@@ -507,12 +698,66 @@ def main(argv=None):
     p = sub.add_parser("artifacts", help="report non-.pf files in a Prefetch folder")
     p.add_argument("folder")
     p.add_argument("--paths", action="store_true", help="also list every path each one holds")
+    p.add_argument("--db", help="write the artifacts to a SQLite database (separate tables "
+                                "from .pf records - these are access, not execution)")
+    p.add_argument("--csv", help="write one row per path, plus a -summary.csv beside it")
+    p.add_argument("--raw-csv", action="store_true",
+                   help="do not prefix formula-trigger cells with an apostrophe")
     p.set_defaults(func=cmd_artifacts)
 
     sub.add_parser("capabilities", help="show available decompressors").set_defaults(
         func=lambda a: (print("decompressors:", ", ".join(available_decompressors())), 0)[1])
 
     args = ap.parse_args(argv)
+
+    # A forced decompressor that does not exist on this host is an environment failure, not a
+    # property of the evidence. Without this check, `--decompressor ntdll` on Linux parsed the
+    # whole folder, failed every single file at the container stage, and exited **0** - so a
+    # script driving the tool recorded a successful run with no findings (AUDIT BUG 79).
+    if getattr(args, "decompressor", None):
+        available = available_decompressors()
+        if args.decompressor not in available:
+            print(f"!! the {args.decompressor!r} decompressor is not available on this host "
+                  f"(available: {', '.join(available)}).\n"
+                  f"   'ntdll' is the Windows OS decompressor; on any other system use "
+                  f"--decompressor pure, which is the default.", file=sys.stderr)
+            return 2
+
+    # Two outputs pointed at one path meant the second write silently destroyed the first,
+    # while the console reported both: "wrote 6 records to X" (the database) followed by
+    # "wrote 6 rows to X" (the CSV, over the top of it), exit 0, and the truncation note
+    # helpfully explaining that the full values are "in the database" - which no longer
+    # existed. An analyst is left holding one artifact and a console that says two
+    # (AUDIT BUG 90).
+    outputs = []
+    for flag in ("db", "csv"):
+        value = getattr(args, flag, None)
+        if value:
+            outputs.append((f"--{flag}", value))
+    # `artifacts --csv` writes a second file beside the one it is given.
+    if getattr(args, "func", None) is cmd_artifacts and getattr(args, "csv", None):
+        from prefetch_core.export import summary_path_for
+        outputs.append(("--csv (its -summary.csv)", summary_path_for(args.csv)))
+    seen: dict[str, str] = {}
+    for flag, value in outputs:
+        key = os.path.realpath(os.path.abspath(value))
+        if key in seen:
+            print(f"!! {seen[key]} and {flag} both write {value!r}. One would silently "
+                  f"overwrite the other and the run would report writing both.",
+                  file=sys.stderr)
+            return 2
+        seen[key] = flag
+    # Distinct names can still be one file: a hard link, or two paths through a symlink that
+    # realpath cannot resolve identically.
+    for i, (flag_a, a) in enumerate(outputs):
+        for flag_b, b in outputs[i + 1:]:
+            try:
+                if os.path.exists(a) and os.path.exists(b) and os.path.samefile(a, b):
+                    print(f"!! {flag_a} ({a!r}) and {flag_b} ({b!r}) are the same file. One "
+                          f"would silently overwrite the other.", file=sys.stderr)
+                    return 2
+            except OSError:
+                pass
     return args.func(args)
 
 

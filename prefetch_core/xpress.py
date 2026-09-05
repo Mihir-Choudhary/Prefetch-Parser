@@ -70,12 +70,16 @@ def _build_decoding_table(source, pos):
     return symbols, bitlens
 
 
-def decompress(data, out_size, max_output=None):
+def decompress(data, out_size, max_output=None, with_consumed=False):
     """Decompress `data`, producing exactly `out_size` bytes.
 
     `max_output` refuses a container that declares more than the caller is willing to hold. The
     declared size is attacker-controlled and a valid stream can expand roughly 256x, so without
     a ceiling "parse this file" can allocate gigabytes before failing.
+
+    `with_consumed` returns `(output, input_bytes_consumed)` instead of just the output. The
+    stream carries no length of its own, so the only way to know whether anything is hiding
+    AFTER it is to notice how much of the input the decoder actually needed (AUDIT BUG 78).
     """
     if max_output is not None and out_size > max_output:
         raise InvalidCompressedData(
@@ -125,7 +129,7 @@ def decompress(data, out_size, max_output=None):
             # as length nibble 0 / offset bit length 0 -> a 3-byte match at offset 1.
             # Skipping it instead loses 3 bytes and desynchronizes the stream.
             if symbol == 256 and len(out) >= out_size:
-                return bytes(out[:out_size])
+                return (bytes(out[:out_size]), pos) if with_consumed else bytes(out[:out_size])
 
             symbol -= 256
             match_length = symbol % 16
@@ -176,7 +180,7 @@ def decompress(data, out_size, max_output=None):
             for k in range(match_length):
                 out.append(out[start + k])
 
-    return bytes(out[:out_size])
+    return (bytes(out[:out_size]), pos) if with_consumed else bytes(out[:out_size])
 
 
 def decompress_mam(raw):

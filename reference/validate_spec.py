@@ -288,6 +288,9 @@ def check(label, got, want):
 
 
 def main():
+    # The documented 683-file result is the real corpora plus the vendored files; without
+    # them this checks 54 synthetic files and still prints ALL CHECKS PASSED.
+    corpus.require("WIN10", "WIN11")
     # --- ground-truth checks -------------------------------------------------
     for rel, gt in GROUND_TRUTH:
         path = os.path.join(CORPUS, rel)

@@ -62,6 +62,15 @@ class Bounds:
     data: bytes
     stage: Stage = Stage.HEADER
     problems: list[Problem] = field(default_factory=list)
+    # The furthest byte any read has reached. One integer, updated per read - enough to answer
+    # "is there anything after the last structure this parser understood?", which is where
+    # residual data from an earlier, longer version of the file turns up.
+    high_water: int = 0
+    # Merged ranges of everything read, so the parser can answer the stronger question: is
+    # there anything ANYWHERE in this file that no field accounts for? Reads run mostly in
+    # order, so the list stays a handful of intervals - the common case appends to or extends
+    # the last one and never scans.
+    covered: list[list[int]] = field(default_factory=list)
 
     def at(self, stage: Stage) -> "Bounds":
         self.stage = stage
@@ -70,6 +79,16 @@ class Bounds:
     def note(self, message: str) -> None:
         """Record a non-fatal problem and carry on."""
         self.problems.append(Problem(self.stage, message))
+
+    def fail(self, stage: "Stage", message: str) -> None:
+        """Record the problem that ENDED the parse.
+
+        `note()` says "the record is usable but imperfect", and using it for the exception that
+        stopped the parse made a record whose two halves disagreed: `parsed_ok` said the file
+        failed while every problem on it said `fatal = 0`, so a query for records with a fatal
+        problem returned nothing at all for a folder full of failures (AUDIT BUG 111).
+        """
+        self.problems.append(Problem(stage, message, fatal=True))
 
     def check(self, offset: int, length: int, what: str) -> None:
         if offset < 0 or length < 0:
@@ -80,3 +99,43 @@ class Bounds:
                 f"{what}: wants bytes {offset}..{offset + length} but the file is "
                 f"{len(self.data)} bytes",
             )
+        if offset + length > self.high_water:
+            self.high_water = offset + length
+        self._cover(offset, offset + length)
+
+    def _cover(self, start: int, end: int) -> None:
+        spans = self.covered
+        if spans:
+            last = spans[-1]
+            if start >= last[0] and start <= last[1]:     # extends or sits inside the last
+                if end > last[1]:
+                    last[1] = end
+                return
+            if start > last[1]:                           # ordinary forward step
+                spans.append([start, end])
+                return
+        else:
+            spans.append([start, end])
+            return
+        # Out-of-order read: insert and merge. Rare enough that the cost does not matter.
+        spans.append([start, end])
+        spans.sort()
+        merged = [spans[0]]
+        for span in spans[1:]:
+            if span[0] <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], span[1])
+            else:
+                merged.append(span)
+        self.covered = merged
+
+    def gaps(self) -> list[tuple[int, int]]:
+        """Byte ranges of the file that no read touched, in order."""
+        out = []
+        cursor = 0
+        for start, end in self.covered:
+            if start > cursor:
+                out.append((cursor, start - cursor))
+            cursor = max(cursor, end)
+        if cursor < len(self.data):
+            out.append((cursor, len(self.data) - cursor))
+        return out

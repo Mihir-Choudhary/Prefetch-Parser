@@ -74,6 +74,7 @@ def compare(path, mismatches):
 
 
 def main():
+    corpus.require("WIN10", "WIN11")
     mismatches = []
     versions = collections.Counter()
     checked = skipped = 0

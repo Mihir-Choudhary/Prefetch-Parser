@@ -1,8 +1,13 @@
 # Working notes, not part of the deliverable
 AUDIT.md
+AUDIT-PLAN.md
 STATE.md
 CONTINUE.md
 sessions/
+
+# Where the corpora live on this machine. Paths name someone's collection; see
+# reference/corpus.py.
+corpus-paths.env
 
 # Third-party material - not ours to redistribute.
 # reference/pf-corpus/ is Eric Zimmerman's published Prefetch test corpus:

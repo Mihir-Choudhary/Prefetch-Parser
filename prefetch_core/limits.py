@@ -20,6 +20,13 @@ Exceeding a ceiling is always reported as a problem on the record, never a silen
 analyst must be able to tell "this file was not fully examined" from "this file was clean".
 """
 
+# One .pf file read whole into memory. The largest real prefetch observed anywhere is under
+# 200 KB; this is 300x that. Without a ceiling here, a single planted 4 GB file named
+# `X.EXE-12345678.pf` turns "scan this folder" into an out-of-memory kill that costs every
+# other record in the run (AUDIT BUG 77). Over the ceiling the file becomes a failed record
+# stating its size - never a silent skip, and never a crash.
+MAX_PREFETCH_BYTES = 64 * 1024 * 1024
+
 # One artifact file read whole into memory.
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 

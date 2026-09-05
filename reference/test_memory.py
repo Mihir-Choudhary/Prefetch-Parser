@@ -13,7 +13,9 @@ Run:  python3 test_memory.py
 import glob
 import os
 import resource
+import sqlite3
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -29,6 +31,7 @@ MAX_MB_PER_RECORD = 0.6
 
 
 def main():
+    corpus.require("WIN11")
     files = sorted(glob.glob(CORPUS))
     if not files:
         print("!! no corpus files", file=sys.stderr)
@@ -56,6 +59,41 @@ def main():
         ok &= match
         # Decoding twice must give equal results - a cached-wrong or consumed-iterator bug.
         ok &= len(sample.trace_chains) == len(decoded)
+
+    # A record carrying a large residue must cost no more than one carrying none. The residue
+    # caps live in scca.py, but the ceiling lives here, and until this check existed the suite
+    # that owns the ceiling had never seen a file with more than ~20 bytes of residue in it
+    # (BUG 61: the region count was capped and the retained bytes were not).
+    print("\na file with a megabyte of residue stays inside the same ceiling:")
+    seed = os.path.join(os.path.dirname(HERE), "reference", "pf-corpus", "XPPro",
+                        "CALC.EXE-02CD573A.pf")
+    with open(seed, "rb") as fh:
+        body = fh.read()
+    with tempfile.TemporaryDirectory() as tmp:
+        crafted = os.path.join(tmp, "RESIDUE.EXE-0BADF00D.pf")
+        with open(crafted, "wb") as fh:
+            fh.write(body + b"\x41" * (1 << 20))     # a megabyte belonging to no field
+        record = parse_file(crafted)
+        retained = sum(len(r.data) for r in record.residue)
+        print(f"  residue found {record.residue_bytes:,} bytes, retained {retained:,}")
+        ok &= record.parsed_ok
+        ok &= record.residue_bytes >= (1 << 20)      # the finding is reported in full...
+        ok &= retained <= 64 * 1024                  # ...and the copy is bounded
+        print(f"  reported in full: {record.residue_bytes >= (1 << 20)}, "
+              f"retained bounded: {retained <= 64 * 1024}")
+
+        # ...and it must not reach the database as a megabyte of BLOBs either.
+        from prefetch_core import store                                # noqa: PLC0415
+
+        db_path = os.path.join(tmp, "out.db")
+        db = store.Store(db_path)
+        db.add(record)
+        db.close()
+        with sqlite3.connect(db_path) as conn:
+            rows, blob = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(bytes)), 0) FROM residue").fetchone()
+        print(f"  database holds {rows} residue row(s), {blob:,} bytes")
+        ok &= blob <= 64 * 1024
 
     print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1

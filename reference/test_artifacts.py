@@ -31,14 +31,22 @@ EXPECT = {
                                                 "slots": 16384, "slots_populated": 2603,
                                                 "wrapped": False, "clock_reversals": 0,
                                                 "clock_last": 1503292}),
+    # Structural now, not a string sweep: paths_found dropped by one because the volume
+    # device name is no longer counted as a file path - it is reported as a volume record.
     ("win10", "cadrespri.7db"): ("superfetch", {"format_version": 3, "size_matches": True,
-                                                "db_type": 19, "paths_found": 13}),
-    ("win10", "dynrespri.7db"): ("superfetch", {"db_type": 19, "paths_found": 559}),
+                                                "db_type": 19, "paths_found": 12,
+                                                "parse_method": "structural",
+                                                "name_hashes_verified": 12}),
+    ("win10", "dynrespri.7db"): ("superfetch", {"db_type": 19, "paths_found": 558,
+                                                "parse_method": "structural",
+                                                "name_hashes_verified": 558}),
     # MAM\x84: payload at +12, not +8. Decompressing to exactly the declared size is the proof.
     ("win10", "ResPriHMStaticDb.ebd"): ("superfetch", {"compressed": True, "db_type": 22,
                                                        "decompressed_size": 153100,
                                                        "size_matches": True,
-                                                       "paths_found": 753}),
+                                                       "paths_found": 753,
+                                                       "parse_method": "scan",
+                                                       "name_hashes_verified": 753}),
     ("win11", "Layout.ini"): ("layout", {"entries": 4268, "user_paths": 357,
                                          "boot_volume_letter": "C"}),
     # Win11's ring HAS wrapped, so the clock must reverse exactly once - not zero (which would
@@ -46,19 +54,29 @@ EXPECT = {
     ("win11", "PfPre_490977ab.mkd"): ("pfpre", {"events_written": 17779, "wrapped": True,
                                                 "slots_populated": 16384, "events_lost": 1395,
                                                 "clock_reversals": 1}),
-    ("win11", "dynrespri.7db"): ("superfetch", {"db_type": 19, "paths_found": 531}),
+    ("win11", "dynrespri.7db"): ("superfetch", {"db_type": 19, "paths_found": 530,
+                                                "parse_method": "structural",
+                                                "name_hashes_verified": 530}),
     ("win11", "ResPriStaticDb.ebd"): ("superfetch", {"compressed": True,
                                                      "decompressed_size": 63932,
-                                                     "size_matches": True}),
+                                                     "size_matches": True,
+                                                     "parse_method": "scan",
+                                                     "name_hashes_verified": 345}),
     ("win11", "Trace2.fx"): ("readyboot", {"declared_size": 7795764, "payload_decoded": True}),
     ("win11", "rblayout.xin"): ("readyboot", {"declared_size": 1583772}),
 }
-EXPECTED_COUNTS = {"win10": 5, "win11": 10}      # win10 has no ReadyBoot subdirectory at all
+# win10 has no ReadyBoot subdirectory at all. Its three extra artifacts are BLAH.TXT,
+# HOST.TXT and PF.zip - files left in the folder by earlier ADS work, which the scanner now
+# REPORTS as unrecognised instead of dropping silently. A file present in a collection is a
+# fact about the collection whether or not this tool can parse it.
+EXPECTED_COUNTS = {"win10": 8, "win11": 10}
+EXPECTED_UNRECOGNISED = {"win10": {"BLAH.TXT", "HOST.TXT", "PF.zip"}, "win11": set()}
 
 failures = []
 
 
 def main():
+    corpus.require("WIN10", "WIN11")
     found = {}
     for tag, root in (("win10", WIN10), ("win11", WIN11)):
         arts = scan_folder(root)
@@ -68,6 +86,14 @@ def main():
         for a in arts:
             found[(tag, a.name)] = a
             print(f"   {a.name:24} {a.kind}")
+        unrecognised = {a.name for a in arts if a.kind == "unrecognised"}
+        if unrecognised != EXPECTED_UNRECOGNISED[tag]:
+            failures.append(f"{tag}: unrecognised {sorted(unrecognised)}, "
+                            f"expected {sorted(EXPECTED_UNRECOGNISED[tag])}")
+        # Everything the folder holds must be accounted for, one way or another.
+        for a in arts:
+            if a.kind == "unrecognised" and not a.problems:
+                failures.append(f"{tag}/{a.name}: unrecognised but says nothing about why")
 
     print("\nfacts:")
     for (tag, name), (kind, facts) in EXPECT.items():
@@ -206,6 +232,68 @@ def main():
         print("   !! decompression bomb accepted")
     except Exception as exc:
         print(f"   decompression bomb refused: {type(exc).__name__}")
+
+    # Until Round 45 the artifacts reached no machine-readable output at all: an investigator
+    # could see 10,118 SuperFetch paths on screen and had no way to get them into a report
+    # except by retyping them (AUDIT BUG 80). They are exported to their own tables and their
+    # own CSV - separate from `.pf` records, because access is not execution - and what comes
+    # out has to equal what was parsed.
+    print("\nthe artifacts reach the exports intact:")
+    import csv as _csv                                                # noqa: PLC0415
+    import sqlite3 as _sqlite3                                        # noqa: PLC0415
+    import subprocess as _sp                                          # noqa: PLC0415
+    import tempfile as _tempfile                                      # noqa: PLC0415
+
+    from prefetch_core.store import Store as _Store                   # noqa: PLC0415
+
+    def _check(label, got, want):
+        flag = "" if got == want else f"   << expected {want}"
+        print(f"  {label:<58} {str(got)[:28]}{flag}")
+        if got != want:
+            failures.append(f"{label}: {got!r} != {want!r}")
+
+    for folder in (corpus.WIN10, corpus.WIN11):
+        found = scan_folder(folder)
+        expected_paths = sum(len(a.paths) + len([p for p, _r, _b in a.io_by_path
+                                                 if p not in set(a.paths)])
+                             for a in found)
+        workdir = _tempfile.mkdtemp()
+        db_path = os.path.join(workdir, "artifacts.db")
+        with _Store(db_path) as store:
+            store.add_artifacts(found)
+            store.add_artifacts(found)          # re-ingest must not double anything
+        conn = _sqlite3.connect(db_path)
+        label = os.path.basename(os.path.dirname(folder)) or folder
+        _check(f"{label}: every artifact is a row",
+               conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0], len(found))
+        _check(f"{label}: every path is a row",
+               conn.execute("SELECT COUNT(*) FROM artifact_path").fetchone()[0], expected_paths)
+        _check(f"{label}: no artifact loses its kind",
+               conn.execute("SELECT COUNT(*) FROM artifact WHERE kind IS NULL "
+                            "OR kind = ''").fetchone()[0], 0)
+        io_rows = sum(len(a.io_by_path) for a in found)
+        _check(f"{label}: ReadyBoot's per-file I/O survives",
+               conn.execute("SELECT COUNT(*) FROM artifact_path "
+                            "WHERE detail LIKE 'reads=%'").fetchone()[0], io_rows)
+        problems = sum(len(a.problems) for a in found)
+        _check(f"{label}: every problem is kept",
+               conn.execute("SELECT COUNT(*) FROM artifact_problem").fetchone()[0], problems)
+
+        csv_path = os.path.join(workdir, "artifacts.csv")
+        run = _sp.run([sys.executable, "-m", "pfcli", "artifacts", folder, "--csv", csv_path],
+                      cwd=os.path.dirname(HERE), capture_output=True, text=True, timeout=600)
+        _check(f"{label}: the CSV command succeeds", run.returncode, 0)
+        _csv.field_size_limit(10 ** 9)
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            rows = list(_csv.DictReader(fh))
+        _check(f"{label}: one CSV row per path", len(rows), expected_paths)
+        summary = os.path.join(workdir, "artifacts-summary.csv")
+        with open(summary, newline="", encoding="utf-8") as fh:
+            summary_rows = list(_csv.DictReader(fh))
+        _check(f"{label}: one summary row per artifact", len(summary_rows), len(found))
+        _check(f"{label}: the summary keeps the facts",
+               all(r["Facts"] or not next(a.facts for a in found if a.name == r["SourceName"])
+                   for r in summary_rows), True)
 
     print("\nPASS" if not failures else "\nFAIL:")
     for f in failures:

@@ -3,18 +3,23 @@
 # parse a file is not a successful build, so the test is part of this script rather than a
 # separate step someone forgets.
 #
-# Prerequisite (this machine does not have it):
-#     python3 -m venv --system-site-packages .venv-build   # needs the python3-venv package
-#     .venv-build/bin/pip install pyinstaller
-# or, accepting the risk of touching the system interpreter:
+# Prerequisite. Any of these works; the third needs neither root nor a virtualenv, which is
+# what this machine has (no python3.14-venv package, no sudo):
+#     python3 -m venv --system-site-packages .venv-build && .venv-build/bin/pip install pyinstaller
 #     pip install --break-system-packages pyinstaller
+#     pip install --break-system-packages --target /some/dir pyinstaller pyside6
+#         then: PYTHONPATH=/some/dir ./packaging/build.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# A --target install has no console script on PATH, so fall back to `python3 -m PyInstaller`,
+# which is the same entry point.
 PYI="${PYI:-pyinstaller}"
 if ! command -v "$PYI" >/dev/null 2>&1; then
     if [ -x .venv-build/bin/pyinstaller ]; then
         PYI=.venv-build/bin/pyinstaller
+    elif python3 -c "import PyInstaller" >/dev/null 2>&1; then
+        PYI="python3 -m PyInstaller"
     else
         echo "pyinstaller not found. See the prerequisite block at the top of this script." >&2
         exit 1
@@ -27,7 +32,8 @@ echo "== running the regression suite first; never ship a red build"
 echo
 echo "== building"
 rm -rf build dist
-"$PYI" packaging/prefetch.spec --noconfirm --distpath dist --workpath build
+# shellcheck disable=SC2086 -- $PYI can be "python3 -m PyInstaller", which must word-split
+$PYI packaging/prefetch.spec --noconfirm --distpath dist --workpath build
 
 OUT="dist/prefetch-explorer"
 echo
@@ -48,8 +54,22 @@ else
     echo "  (no sample file at $SAMPLE; skipped the parse check)" >&2
 fi
 
-QT_QPA_PLATFORM=offscreen "$OUT/pfgui" --help >/dev/null 2>&1 || true
-echo "  frozen GUI binary is executable: ok"
+# `|| true` does not protect against a HANG, and this hung: the frozen GUI took --help for a
+# path, started the event loop and sat there until the build timed out. --help must answer and
+# exit, so a timeout here is a build failure, not a shrug.
+if ! timeout 60 env QT_QPA_PLATFORM=offscreen "$OUT/pfgui" --help >/dev/null 2>&1; then
+    echo "frozen pfgui did not answer --help within 60s" >&2
+    exit 1
+fi
+echo "  frozen GUI answers --help and exits: ok"
+
+# And it must actually start Qt, which --help deliberately does not do.
+if ! timeout 120 env QT_QPA_PLATFORM=offscreen PREFETCH_GUI_SELFTEST=1 \
+        "$OUT/pfgui" >/dev/null 2>&1; then
+    echo "frozen pfgui could not start Qt" >&2
+    exit 1
+fi
+echo "  frozen GUI starts Qt: ok"
 
 echo
 du -sh "$OUT"

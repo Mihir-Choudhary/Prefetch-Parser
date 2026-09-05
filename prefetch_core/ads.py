@@ -123,6 +123,23 @@ class AdsUnavailable(Exception):
 # --------------------------------------------------------------------------
 # Backends
 # --------------------------------------------------------------------------
+def _win32_error(err: int, message: str, path: str) -> OSError:
+    """Build the exception a Win32 failure deserves.
+
+    `OSError(err, msg)` puts a **Win32** error code in `errno`, so a report reads `[Errno 5]`
+    where 5 means EIO on POSIX and ERROR_ACCESS_DENIED here - two unrelated meanings for the
+    same number, in a document whose value is that it can be trusted. On Windows the four-
+    argument form renders `[WinError 5] ...`, which is the code an analyst can look up
+    (AUDIT BUG 100). Off Windows the two-argument form is kept, because there is no winerror
+    field to fill and the number is still worth carrying.
+    """
+    import sys                                                        # noqa: PLC0415
+
+    if sys.platform == "win32":
+        return OSError(0, f"{message} (Win32 error {err})", path, err)
+    return OSError(err, f"{message} on {path!r} (Win32 error {err})")
+
+
 class _Win32Backend:
     """`FindFirstStreamW` / `FindNextStreamW` via ctypes."""
 
@@ -130,35 +147,46 @@ class _Win32Backend:
         _fields_ = [("StreamSize", ctypes.c_longlong),
                     ("cStreamName", ctypes.c_wchar * 296)]
 
-    def __init__(self):
-        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    def __init__(self, load=None):
+        # `load` is a seam, not a feature: the declarations below are Windows-only code that no
+        # test could reach, because __init__ could not even be entered off Windows. A stub DLL
+        # passed here lets the argument types themselves be checked (AUDIT BUG 100).
+        load = load or getattr(ctypes, "WinDLL", None)
+        if load is None:
+            raise OSError("WinDLL is unavailable: not a Windows host")
+        self.kernel32 = load("kernel32", use_last_error=True)
         # Declare both argtypes and restype. Left to ctypes' defaults a HANDLE is marshalled as
         # a C int, which truncates on 64-bit Windows - the classic way this API "works on my
         # machine" and then fails on a real host.
         self.kernel32.FindFirstStreamW.argtypes = [
             ctypes.c_wchar_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
         self.kernel32.FindFirstStreamW.restype = ctypes.c_void_p
+        # BOOL is a 4-byte int, not a C99 bool. `c_bool` reads one byte of the return
+        # register, so a BOOL whose low byte happens to be zero would read as False - the end
+        # of the enumeration, in the routine whose whole job is finding hidden streams. The
+        # documented type is BOOL; declare it and compare against zero explicitly.
         self.kernel32.FindNextStreamW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        self.kernel32.FindNextStreamW.restype = ctypes.c_bool
+        self.kernel32.FindNextStreamW.restype = ctypes.c_int
         self.kernel32.FindClose.argtypes = [ctypes.c_void_p]
-        self.kernel32.FindClose.restype = ctypes.c_bool
+        self.kernel32.FindClose.restype = ctypes.c_int
 
     def list_streams(self, path: str) -> list[Stream]:
         data = self._WIN32_FIND_STREAM_DATA()
         handle = self.kernel32.FindFirstStreamW(
-            ctypes.c_wchar_p(path), _FIND_STREAM_INFO_STANDARD, ctypes.byref(data), 0)
-        if handle in (None, _INVALID_HANDLE_VALUE):
+            ctypes.c_wchar_p(winpath.long_path(path)), _FIND_STREAM_INFO_STANDARD,
+            ctypes.byref(data), 0)
+        if handle in (None, 0, _INVALID_HANDLE_VALUE):
             err = _get_last_error()
             if err == _ERROR_HANDLE_EOF:
                 return []
-            raise OSError(err, f"FindFirstStreamW failed on {path!r}")
+            raise _win32_error(err, "FindFirstStreamW failed", path)
         streams = []
         try:
             while True:
                 streams.append(Stream(path, data.cStreamName, data.StreamSize))
                 # Clear first: the value is only meaningful for the call that just failed.
                 _set_last_error(0)
-                if not self.kernel32.FindNextStreamW(handle, ctypes.byref(data)):
+                if self.kernel32.FindNextStreamW(handle, ctypes.byref(data)) == 0:
                     err = _get_last_error()
                     # FALSE means end-of-enumeration ONLY when the error is ERROR_HANDLE_EOF.
                     # Any other error is a real failure, and treating it as the end silently
@@ -166,8 +194,9 @@ class _Win32Backend:
                     # finding streams somebody hid. FindFirstStreamW above already makes this
                     # distinction; leaving it out here was an asymmetry, not a decision.
                     if err not in (0, _ERROR_HANDLE_EOF):
-                        raise OSError(err, f"FindNextStreamW failed on {path!r} after "
-                                           f"{len(streams)} stream(s); the list is incomplete")
+                        raise _win32_error(
+                            err, f"FindNextStreamW failed after {len(streams)} stream(s); "
+                                 f"the list is incomplete", path)
                     break
         finally:
             self.kernel32.FindClose(handle)
@@ -180,7 +209,7 @@ class _Win32Backend:
         # metadata: it can be stale, and on a supplied image it can simply be false. An
         # unbounded read here would let a stream that under-declares its size pull the whole
         # file into memory regardless of the ceiling.
-        with open(stream.open_path, "rb") as fh:
+        with open(winpath.long_path(stream.open_path), "rb") as fh:
             return fh.read(MAX_STREAM_BYTES + 1)
 
 
@@ -330,15 +359,34 @@ def _unreadable(stream, primary_size, carrier_is_pf, folder, times, message):
 
 
 def _is_outside(path: str, prefetch_folder: str | None) -> bool:
-    """A prefetch file recovered from outside \\Windows\\Prefetch is itself a finding."""
+    """A prefetch file recovered from outside \\Windows\\Prefetch is itself a finding.
+
+    Two rules, and both errors are not equal. A **false "outside"** puts a finding in a report
+    that never happened; a false "inside" omits a flag from a record the analyst can still read
+    in full, carrier path and all. So where the answer is uncertain this says *inside*, the same
+    way the volume correlation withholds a drive letter rather than guessing one.
+
+    Comparisons are case-insensitive. NTFS is, and both paths come off the same volume: with a
+    literal comparison, `...\\Windows\\prefetch\\X.pf` collected under a folder recorded as
+    `...\\Windows\\Prefetch` was reported as recovered from OUTSIDE the Prefetch folder - a
+    fabricated finding, produced by nothing but the spelling of a folder (AUDIT BUG 93).
+    """
     if prefetch_folder:
         try:
-            return os.path.commonpath([os.path.abspath(path),
-                                       os.path.abspath(prefetch_folder)]) \
-                != os.path.abspath(prefetch_folder)
+            here = os.path.normcase(os.path.abspath(path)).lower()
+            folder = os.path.normcase(os.path.abspath(prefetch_folder)).lower()
+            return os.path.commonpath([here, folder]) != folder
         except ValueError:                 # different drives on Windows
             return True
-    return "\\prefetch" not in path.lower().replace("/", "\\")
+    # No folder given, so the path itself has to answer it. `"\\prefetch" in path` did that by
+    # substring, which called `C:\\Users\\bob\\Desktop\\prefetch\\evil.exe` *inside* the
+    # Prefetch folder and suppressed the very flag that makes an ADS-hosted prefetch worth
+    # looking at - and `...\\Windows\\PrefetchOld\\` with it (AUDIT BUG 94). The two folder
+    # names have to be adjacent path components, which is the only thing that identifies the
+    # real one.
+    parts = [part for part in path.lower().replace("/", "\\").split("\\") if part]
+    return not any(parts[i] == "windows" and parts[i + 1] == "prefetch"
+                   for i in range(len(parts) - 1))
 
 
 def scan_tree(root: str, backend=None, include_directories: bool = True,
@@ -379,16 +427,24 @@ def scan_tree(root: str, backend=None, include_directories: bool = True,
         for target in targets:
             try:
                 findings.extend(scan_file(target, backend, prefetch_folder=root))
-            except OSError as exc:
+            # Not just OSError. The Windows backend raises OSError, but the documented
+            # off-Windows backend is `dissect.ntfs`, which raises its own exception types on a
+            # corrupt MFT entry - and one of those ended the ENTIRE scan with nothing reported
+            # (AUDIT BUG 81). On the search for deliberately hidden evidence, an aborted scan
+            # that printed nothing is the worst outcome the module has.
+            except AdsUnavailable:
+                raise
+            except Exception as exc:
                 # Keep walking - one locked file must not end the scan - but never silently.
                 # On a live system the entries that refuse enumeration are the in-use and
                 # ACL-restricted ones, which is exactly where someone would hide a payload.
                 # Skipping them without a word turns "could not examine 40 files" into "no
                 # prefetch found in any alternate data stream".
                 #
-                # AdsUnavailable is deliberately NOT caught: the backend was resolved above and
-                # is passed explicitly, so scan_file cannot raise it here. Catching it anyway
-                # would mask exactly the condition it exists to signal.
+                # AdsUnavailable is re-raised above and never lands here: the backend was
+                # resolved before the walk and is passed explicitly, so a missing backend is a
+                # property of the run, not of one entry. Swallowing it would mask exactly the
+                # condition it exists to signal.
                 if on_error is not None:
                     on_error(target, exc)
                 continue

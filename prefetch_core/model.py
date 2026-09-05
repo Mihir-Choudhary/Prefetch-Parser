@@ -56,6 +56,22 @@ class FileMetric:
     name_offset: int
     name_size: int
     mft_ref: MftRef | None = None
+    # The first two dwords of every metric entry, which every parser calls "unknown", are the
+    # file's own slice of the trace-chain array: `chain_start` is the index of its first entry
+    # and `chain_count` how many belong to it. Measured across 284 files spanning all five
+    # versions: the slices partition the array exactly - they sum to the chain count and the
+    # last slice ends on it, with no gaps and no overlaps. That is what lets a loaded file be
+    # tied to the prefetcher's block-load bookkeeping instead of the two being unrelated lists.
+    chain_start: int = 0
+    chain_count: int = 0
+    # A third dword, absent on v17. Never exceeds `chain_count` and equals it about half the
+    # time, so it is a subset of the file's own chains - plausibly the blocks actually fetched.
+    # Reported as a number, not as a meaning.
+    chain_subset: int | None = None
+    # A small bitfield, 14 distinct values across the corpus. It *correlates* with file type -
+    # DLLs are mostly 0x100, .NLS/.MUI/.JS mostly 1/2/4 - but the correlation is not a mapping
+    # and no bit has been identified. Surfaced raw; the distribution is in the format doc.
+    flags: int = 0
 
 
 @dataclass(slots=True)
@@ -82,6 +98,24 @@ class TraceChain:
     # per-object __dict__ dominated total memory (3.1 MB per record).
 
 
+@dataclass(slots=True)
+class Residue:
+    """A run of non-zero bytes that no parsed field covers.
+
+    `text` is filled only when the bytes read as UTF-16 - which is how these usually appear,
+    being the tail of a path string the record used to hold.
+    """
+
+    offset: int
+    size: int
+    data: bytes
+    text: str = ""
+
+    def __str__(self) -> str:
+        shown = self.text if self.text else self.data[:16].hex(" ")
+        return f"{self.size} byte(s) at {self.offset}: {shown!r}"
+
+
 @dataclass
 class Volume:
     device_name: str
@@ -93,6 +127,25 @@ class Volume:
     # `\VOLUME{hex-hex}` encodes the creation FILETIME and serial, so the name can be checked
     # against the parsed fields for free. None where the name is \DEVICE\HARDDISKVOLUMEn.
     name_self_check: bool | None = None
+    # The count the reference array's own header states, and the slot each retained reference
+    # sat in. Null slots are dropped from `file_refs` - they carry nothing - but dropping them
+    # silently also dropped the file's declared count and every reference's POSITION, so a
+    # volume that reserved 35 slots and filled 3 was reported as "3 references" with no way
+    # back to what the file said (AUDIT BUG 76).
+    declared_ref_count: int = 0
+    ref_slots: list[int] = field(default_factory=list)
+    # Everything past +36 of the volume entry - 4 bytes on v17, 68 on v23/26, 60 on v30/31.
+    # Documented by nobody as anything, populated on real files, so kept rather than skipped.
+    raw_tail: bytes = b""
+    # First dword of the file-reference array: 3 on every file measured. A version or type
+    # marker; read so that a file where it differs is visible rather than invisible.
+    ref_array_version: int = 0
+    # Reference-shaped values sitting inside the declared array but past the count it states.
+    # Present on 19 of 183 corpus files, always one entry, always a plausible MFT reference.
+    # Kept separate from `file_refs`: they are not part of what the file claims, and a report
+    # must not present them as if they were. Nor may they be dropped - unclaimed structure in
+    # a forensic artifact is exactly what an examiner wants to be told about.
+    slack_refs: list[MftRef] = field(default_factory=list)
 
 
 @dataclass
@@ -119,6 +172,25 @@ class Prefetch:
 
     filenames: list[str] = field(default_factory=list)
     metrics: list[FileMetric] = field(default_factory=list)
+    # The file-information section verbatim (68-220 bytes). Ten of its dwords are not
+    # documented by anyone and are populated on real files, so discarding them would be
+    # discarding evidence nobody has decoded yet. Kept whole, exposed by `pfcli info`, and
+    # never presented as meaning anything.
+    fileinfo_raw: bytes = b""
+    fileinfo_offset: int = 84
+    # The 84-byte header verbatim. Two of its dwords (+8 and +80) are documented as unknown by
+    # every published description and are populated on real files.
+    header_raw: bytes = b""
+    # Every byte no field accounts for and that is not zero. The prefetcher rewrites a `.pf`
+    # in place and does not zero what it no longer needs, so fragments of an earlier, longer
+    # version of the same record survive - usually in the tail, sometimes in the alignment
+    # padding between structures. Not part of what the file claims; never merged into the
+    # parsed lists; never dropped either.
+    residue: list["Residue"] = field(default_factory=list)
+
+    @property
+    def residue_bytes(self) -> int:
+        return sum(r.size for r in self.residue)
     volumes: list[Volume] = field(default_factory=list)
 
     total_directory_count: int = -1           # v17 stores -1; not an error
@@ -195,6 +267,21 @@ class Prefetch:
     carrier_created: datetime.datetime | None = None
     carrier_modified: datetime.datetime | None = None
     carrier_accessed: datetime.datetime | None = None
+
+    # The filename against the record's own header. On all 754 corpus files the filename's
+    # hash equals the header's, so a disagreement is not noise - it means the file was renamed
+    # or the header edited. None where the name is not in `<NAME>-<HASH8>.pf` shape at all
+    # (an Op-*.pf, a stream name, a copy someone renamed by hand): three states, never two.
+    # Bytes left in the container after the compressed stream ended. A MAM container states
+    # only its OUTPUT size, so anything appended rides along, decompresses to nothing, and the
+    # file still parses perfectly - a hiding place (AUDIT BUG 78). Real files leave 0-3 bytes
+    # of bitstream padding. None means NOT MEASURED (the OS decompressor does not report how
+    # much input it consumed), which is not the same as zero.
+    container_trailing_bytes: int | None = None
+    decompressor_used: str = ""
+
+    filename_hash_match: bool | None = None
+    filename_name_match: bool | None = None
 
     is_op_file: bool = False                  # Op-*.pf: no 5a field, no recoverable path
     # True when a name or path contains characters that render differently than they are

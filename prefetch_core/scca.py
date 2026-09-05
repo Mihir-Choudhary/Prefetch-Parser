@@ -10,12 +10,13 @@ Everything non-obvious here is measured, not copied. See docs/prefetch-format.md
 from __future__ import annotations
 
 import datetime
+import re
 import struct
 from dataclasses import dataclass
 
 from . import container, winpath
 from .errors import Bounds, PrefetchError, Problem, Stage
-from .model import FileMetric, MftRef, PathSource, Prefetch, Volume
+from .model import FileMetric, MftRef, PathSource, Prefetch, Residue, Volume
 
 FILETIME_EPOCH = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
 HEADER_SIZE = 84
@@ -118,19 +119,30 @@ def parse(data: bytes, source_path: str = "", prefer_decompressor: str | None = 
     pf = Prefetch(source_path=source_path)
     pf.is_op_file = winpath.basename(source_path).upper().startswith("OP-")
 
+    report: dict = {}
     try:
-        body = container.load(data, prefer_decompressor)
+        body = container.load(data, prefer_decompressor, report)
     except PrefetchError as exc:
         pf.failed_stage = exc.stage.value
         pf.problems.append(Problem(exc.stage, exc.message, fatal=True))
         return pf
 
+    pf.decompressor_used = report.get("decompressor", "")
+    pf.container_trailing_bytes = report.get("trailing")
     b = Bounds(body)
+    # Padding is 0-3 bytes on every real file measured (642 MAM containers plus the two
+    # compressed SuperFetch databases). More than that is data riding along inside the file.
+    if pf.container_trailing_bytes is not None and pf.container_trailing_bytes > 8:
+        b.at(Stage.CONTAINER).note(
+            f"{pf.container_trailing_bytes:,} byte(s) follow the end of the compressed stream "
+            f"inside this file - they decompress to nothing and are carried, not parsed")
     try:
         _parse_body(b, pf)
     except PrefetchError as exc:
+        # The problem that ended the parse is fatal by definition. Recorded as such, so the
+        # record's verdict and its problems say the same thing (AUDIT BUG 111).
         pf.failed_stage = exc.stage.value
-        b.at(exc.stage).note(exc.message)
+        b.fail(exc.stage, exc.message)
     pf.problems = b.problems
     return pf
 
@@ -139,6 +151,9 @@ def _parse_body(b: Bounds, pf: Prefetch) -> None:
     # --- signature ---------------------------------------------------------
     b.at(Stage.SIGNATURE)
     pf.version = _i32(b, 0, "version")
+    if len(b.data) >= HEADER_SIZE:
+        b.check(0, HEADER_SIZE, "header")
+        pf.header_raw = bytes(b.data[:HEADER_SIZE])
     b.check(4, 4, "signature")
     if b.data[4:8] != b"SCCA":
         raise PrefetchError(Stage.SIGNATURE, f"expected 'SCCA', got {b.data[4:8]!r}")
@@ -180,6 +195,13 @@ def _parse_body(b: Bounds, pf: Prefetch) -> None:
     if layout.dir_count_offset is not None:
         pf.total_directory_count = _i32(b, fi + layout.dir_count_offset, "total directory count")
 
+    # Keep the section itself. Its size is `metrics_offset - 84` on every file measured, which
+    # is also how the self-describing versions are handled everywhere else here.
+    section = metrics_offset - fi
+    if 0 < section <= 512 and fi + section <= len(b.data):
+        b.check(fi, section, "file-information section")
+        pf.fileinfo_raw = bytes(b.data[fi:fi + section])
+
     slots = layout.runtime_slots
     for i in range(slots):
         ticks = _i64(b, fi + layout.runtime_offset + 8 * i, f"run time {i}")
@@ -209,6 +231,10 @@ def _parse_body(b: Bounds, pf: Prefetch) -> None:
     b.at(Stage.METRICS)
     v17 = pf.version == 17
     name_off_field, name_size_field = (8, 12) if v17 else (12, 16)
+    # v17 puts the flags where later versions put the third chain field; everything else is
+    # shifted by 4. Reading these was not optional bookkeeping: they are the only link between
+    # a loaded file and the trace-chain entries it caused (see FileMetric).
+    flags_field = 16 if v17 else 20
     metrics = []
     for i in range(max(metrics_count, 0)):
         o = metrics_offset + i * layout.metric
@@ -216,6 +242,10 @@ def _parse_body(b: Bounds, pf: Prefetch) -> None:
             _i32(b, o + name_off_field, f"metric {i} name offset"),
             _i32(b, o + name_size_field, f"metric {i} name size"),
             None if v17 else _mft_ref(b, o + 24, f"metric {i} MFT reference"),
+            _i32(b, o + 0, f"metric {i} chain start"),
+            _i32(b, o + 4, f"metric {i} chain count"),
+            None if v17 else _i32(b, o + 8, f"metric {i} chain subset"),
+            _i32(b, o + flags_field, f"metric {i} flags"),
         ))
 
     # --- trace chains -------------------------------------------------------
@@ -250,13 +280,25 @@ def _parse_body(b: Bounds, pf: Prefetch) -> None:
     # Pair each metric with its own name. name_offset is a BYTE offset from the block start;
     # name_size is a CHARACTER count excluding the NUL. Established empirically - the reference
     # throws this pairing away by splitting the whole blob on NULs.
-    for i, (noff, nsize, ref) in enumerate(metrics):
+    for i, (noff, nsize, ref, start, count, subset, flags) in enumerate(metrics):
         try:
             name = _utf16(b, names_offset + noff, nsize * 2, f"metric {i} filename")
         except PrefetchError:
             b.note(f"metric {i} filename offset {noff} is outside the string block")
             name = ""
-        pf.metrics.append(FileMetric(i, name, noff, nsize, ref))
+        pf.metrics.append(FileMetric(i, name, noff, nsize, ref,
+                                     chain_start=start, chain_count=count,
+                                     chain_subset=subset, flags=flags))
+
+    # The slices must tile the chain array. A gap or an overlap means one of the three counts
+    # is being read wrong, and that is worth saying out loud rather than leaving to a reader to
+    # notice that the numbers do not add up.
+    if pf.metrics and pf.trace_chain_count > 0:
+        covered = sum(m.chain_count for m in pf.metrics)
+        end = pf.metrics[-1].chain_start + pf.metrics[-1].chain_count
+        if covered != pf.trace_chain_count or end != pf.trace_chain_count:
+            b.note(f"file metrics claim {covered} trace chains ending at {end}, "
+                   f"but the header declares {pf.trace_chain_count}")
 
     # --- 5a: the undocumented trailing executable-path string ---------------
     b.at(Stage.EXEC_PATH)
@@ -273,7 +315,8 @@ def _parse_body(b: Bounds, pf: Prefetch) -> None:
     # --- volumes ------------------------------------------------------------
     b.at(Stage.VOLUMES)
     for j in range(max(vol_count, 0)):
-        pf.volumes.append(_parse_volume(b, vols_offset + j * layout.volume, vols_offset, j))
+        pf.volumes.append(_parse_volume(b, vols_offset + j * layout.volume, vols_offset, j,
+                                        layout.volume))
 
     if pf.total_directory_count >= 0:
         total = sum(len(v.directories) for v in pf.volumes)
@@ -282,13 +325,134 @@ def _parse_body(b: Bounds, pf: Prefetch) -> None:
 
     _resolve_path(pf, stored)
 
+    _residue(b, pf)
+
+    _check_filename(b, pf)
+
+    # The file's OWN NAME belongs in this check. It is attacker-chosen - whoever wrote the file
+    # into the folder chose it - and a right-to-left override there renders the row as a
+    # different filename entirely, which is the whole point of the technique. Leaving it out
+    # meant a file called `INVOICE<RTL>gnp.exe-12345678.pf` was not flagged as deceptive at all
+    # (AUDIT BUG 83).
     pf.deceptive_characters = any(
         winpath.has_deceptive_characters(t)
-        for t in [pf.executable_name, pf.executable_path or "", pf.hosted_package or ""]
+        for t in [pf.executable_name, pf.executable_path or "", pf.hosted_package or "",
+                  winpath.basename(pf.source_path or "")]
         + pf.filenames)
 
+    # A name that is not valid text is a fact about the evidence, not just a rendering problem.
+    # NTFS allows unpaired surrogates and a folder copied out of an image carries whatever bytes
+    # the name held; the exports now show those bytes as escapes rather than dying on them
+    # (AUDIT BUG 102), and the record says so, because "the name shown is not the name stored"
+    # is exactly what an analyst must not have to infer.
+    if winpath.has_undecodable_bytes(pf.source_path or ""):
+        b.at(Stage.HEADER).note(
+            f"the file's name is not valid text: shown here as "
+            f"{winpath.readable_text(winpath.basename(pf.source_path))!r}, with the "
+            f"undecodable bytes escaped")
 
-def _parse_volume(b: Bounds, vo: int, vols_offset: int, index: int) -> Volume:
+
+# Case-insensitive: Windows filenames are, `pfcli` discovers `.PF` as readily as `.pf`, and
+# with a case-sensitive pattern here a rename to `CALC.EXE-DEADBEEF.PF` matched nothing, so the
+# check reported "not applicable" and said nothing at all. The one anti-forensic move this
+# exists to catch was defeated by the shift key (AUDIT BUG 95).
+_PF_NAME = re.compile(r"^(?P<stem>.+)-(?P<hash>[0-9A-Fa-f]{8})\.pf$", re.IGNORECASE)
+
+
+def _check_filename(b: Bounds, pf: Prefetch) -> None:
+    """Compare the file's NAME with what the record itself says.
+
+    Windows derives a prefetch filename from the executable name and a hash of its path, and
+    the header holds both independently. On every one of the 754 corpus files the two agree -
+    so a disagreement is a finding, not noise: it means the file was renamed, copied under
+    another name, or planted. Nothing else in the tool looked at the filename at all, so the
+    one anti-forensic move that costs nothing to make went unremarked (AUDIT BUG 75).
+
+    Both fields stay None when the name is not in `<NAME>-<HASH8>.pf` shape - an `Op-*.pf`, a
+    record recovered from a stream, a hand-renamed copy - because "not applicable" is not the
+    same as "matches".
+    """
+    name = winpath.basename(pf.source_path or "")
+    match = _PF_NAME.match(name)
+    if not match or not pf.executable_name:
+        return
+    if pf.hash:
+        pf.filename_hash_match = match.group("hash").upper() == pf.hash.upper()
+        if not pf.filename_hash_match:
+            b.at(Stage.HEADER).note(
+                f"filename says hash {match.group('hash').upper()} but the header says "
+                f"{pf.hash} - this file has been renamed, or its header edited")
+    stem = match.group("stem").upper()
+    stored = pf.executable_name.upper()
+    # A truncated header name is a prefix of the real one by construction, so compare only what
+    # the header could hold; otherwise every 29-character name would report a false mismatch.
+    pf.filename_name_match = stem.startswith(stored) if pf.name_truncated else stem == stored
+    if not pf.filename_name_match:
+        b.at(Stage.HEADER).note(
+            f"filename says {stem!r} but the header says {stored!r} - this file has been "
+            f"renamed, or it is a copy under another name")
+
+
+# How many residue regions to keep, and how much of each. A crafted file can be one long
+# alternation of non-zero bytes and read fields, which would otherwise materialise a region per
+# gap - the same unbounded-allocation shape this project already refuses for count fields. The
+# totals reported stay exact; only the retained detail is capped.
+_RESIDUE_MAX_REGIONS = 256
+# ...and a ceiling on the total kept, because 256 regions x 4 KB each is a megabyte of retained
+# bytes per record - well past the 0.6 MB/record the memory suite allows, and a BLOB per region
+# in the database besides. Capping the count alone bounded the wrong axis.
+_RESIDUE_MAX_TOTAL = 64 * 1024
+# How much of any one residue to keep. The count is always exact; this bounds the copy.
+_RESIDUE_CAP = 4096
+_PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09}
+
+
+def _residue(b: Bounds, pf: Prefetch) -> None:
+    """Report every non-zero byte in the file that no parsed field accounts for.
+
+    The prefetcher rewrites a `.pf` in place and does not zero what it no longer needs, so
+    fragments of an earlier, longer version of the same record survive - `TY\\RESO` at the end
+    of an ANTIGRAVITY.EXE record, `LES\\WIN` in another, a stray `{` in the padding between two
+    structures. 104 of 698 corpus files carry some.
+
+    This is what makes "the parser reads the whole file" checkable rather than asserted: the
+    bounds-checked reader records every range it touched, so the complement is exactly what was
+    not read, and anything non-zero in there is reported instead of disappearing.
+    """
+    skipped_regions = skipped_bytes = retained = 0
+    for offset, size in b.gaps():
+        chunk = b.data[offset:offset + size]
+        if not any(chunk):
+            continue                              # alignment padding, which is what it should be
+        if len(pf.residue) >= _RESIDUE_MAX_REGIONS or retained >= _RESIDUE_MAX_TOTAL:
+            skipped_regions += 1
+            skipped_bytes += size
+            continue
+        room = min(_RESIDUE_CAP, _RESIDUE_MAX_TOTAL - retained)
+        kept = bytes(chunk[:room])
+        retained += len(kept)
+        text = ""
+        even = kept[0::2]
+        if len(even) >= 2 and sum(1 for c in even if c in _PRINTABLE) >= len(even) * 0.8:
+            text = kept.decode("utf-16-le", errors="replace").strip("\x00")
+        pf.residue.append(Residue(offset=offset, size=size, data=kept, text=text))
+
+    if skipped_regions:
+        b.at(Stage.VOLUMES).note(
+            f"{skipped_regions} further residue region(s) totalling {skipped_bytes} byte(s) "
+            f"were not retained: the caps of {_RESIDUE_MAX_REGIONS} regions and "
+            f"{_RESIDUE_MAX_TOTAL:,} retained bytes apply")
+    if pf.residue:
+        total = sum(r.size for r in pf.residue) + skipped_bytes
+        first = pf.residue[0]
+        b.at(Stage.VOLUMES).note(
+            f"{total} byte(s) in {len(pf.residue)} region(s) belong to no field of this file - "
+            f"residue of an earlier version of it, reported separately"
+            + (f", e.g. {first.text[:40]!r}" if first.text else ""))
+
+
+def _parse_volume(b: Bounds, vo: int, vols_offset: int, index: int, entry_size: int = 0
+                  ) -> Volume:
     dev_offset = _i32(b, vo + 0, f"volume {index} device offset")
     dev_chars = _i32(b, vo + 4, f"volume {index} device name length")
     created_ticks = _i64(b, vo + 8, f"volume {index} creation time")
@@ -302,9 +466,12 @@ def _parse_volume(b: Bounds, vo: int, vols_offset: int, index: int) -> Volume:
     device = _utf16(b, vols_offset + dev_offset, dev_chars * 2, f"volume {index} device name")
 
     refs: list[MftRef] = []
+    slots: list[int] = []
     ro = vols_offset + refs_offset
+    ref_version = _u32(b, ro + 0, f"volume {index} reference array version")
     num_refs = _u32(b, ro + 4, f"volume {index} reference count")
     p = ro + 8
+    slot = 0
     # Count ITERATIONS, not appended refs. Null (all-zero) slots are dropped from the output,
     # so bounding the loop by len(refs) would read one extra entry for every null skipped and
     # walk past the end of the declared array.
@@ -316,7 +483,23 @@ def _parse_volume(b: Bounds, vo: int, vols_offset: int, index: int) -> Volume:
         ref = _mft_ref(b, p, f"volume {index} file reference")
         if ref is not None:
             refs.append(ref)
+            slots.append(slot)     # where it sat, so a null slot costs no position
         p += 8
+        slot += 1
+
+    # Whatever remains inside the declared array after the counted references. The file says
+    # it holds `num_refs`; if the array it reserved is longer and the extra bytes are not zero,
+    # something is there. Read it, label it, and let the analyst decide.
+    slack: list[MftRef] = []
+    used = 8 + max(num_refs, 0) * 8
+    for q in range(ro + used, ro + max(refs_size, 0) - 7, 8):
+        if q + 8 > len(b.data):
+            break
+        if not any(b.data[q:q + 8]):
+            continue
+        found = _mft_ref(b, q, f"volume {index} slack reference")
+        if found is not None:
+            slack.append(found)
 
     dirs: list[str] = []
     p = vols_offset + dirs_offset
@@ -328,6 +511,24 @@ def _parse_volume(b: Bounds, vo: int, vols_offset: int, index: int) -> Volume:
 
     vol = Volume(device, serial, created, created_ticks, dirs, refs)
     vol.name_self_check = _check_volume_name(device, serial, created_ticks)
+    vol.ref_array_version = ref_version
+    vol.declared_ref_count = max(num_refs, 0)
+    vol.ref_slots = slots
+    # A file that reserves slots and leaves most of them empty is normal, but the difference
+    # between "3 references" and "3 of the 35 slots this file declares" is the difference
+    # between a number and a fact.
+    if vol.declared_ref_count != len(refs):
+        b.note(f"volume {index}: {len(refs)} of the {vol.declared_ref_count} declared "
+               f"reference slots hold a reference; the rest are empty")
+    vol.slack_refs = slack
+    if slack:
+        b.note(f"volume {index}: {len(slack)} reference-shaped value(s) in the unused slack of "
+               f"the file-reference array - not counted by the file, reported separately")
+    # The tail past +36 is undocumented and populated. Kept so `pfcli info` can show it: a
+    # field nobody has decoded is still evidence, and dropping it makes that unrecoverable.
+    if entry_size > 36 and vo + entry_size <= len(b.data):
+        b.check(vo + 36, entry_size - 36, f"volume {index} undecoded tail")
+        vol.raw_tail = bytes(b.data[vo + 36:vo + entry_size])
     return vol
 
 

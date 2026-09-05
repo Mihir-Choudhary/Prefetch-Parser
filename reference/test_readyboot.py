@@ -34,6 +34,12 @@ failures = []
 
 
 def check(label, ok, detail=""):
+    # This file's helper takes a CONDITION; others in this directory take (got, want). Passing
+    # a value where a condition belongs inverts the check silently - an empty list reads as a
+    # failure, a count of 1 reads as a pass - and it has happened three times while writing
+    # these suites. A boolean is now required, so the mistake fails loudly and immediately.
+    if not isinstance(ok, bool):
+        raise TypeError(f"check({label!r}) needs a condition, got {type(ok).__name__} {ok!r}")
     print(f"  {label:56} {'ok' if ok else 'FAIL'}"
           f"{'  ' + str(detail) if detail and not ok else ''}")
     if not ok:
@@ -62,11 +68,12 @@ def real_files():
 
 
 def main():
+    corpus.require("WIN11")
     files = real_files()
     if not files:
-        print("This suite needs a Win11 corpus with a ReadyBoot/ folder.", file=sys.stderr)
-        print("Set PREFETCH_CORPUS_WIN11. See reference/corpus.py.", file=sys.stderr)
-        return 1
+        corpus.skip("the configured Win11 corpus has no ReadyBoot/ folder: "
+                    + os.path.join(corpus.WIN11, "ReadyBoot"),
+                    "Win10 folders have none - this suite needs a Win11 collection.")
 
     print("real ReadyBoot files decode to exactly their declared size:")
     for path in files:
@@ -266,8 +273,27 @@ def main():
     check("no lone surrogate reaches the output",
           all(n.encode("utf-8", errors="strict") for n in names))
 
+    # Round 49. The per-file I/O totals are an attribution of the trace's own events, and the
+    # trace states how many events it holds. If the two disagree, the attribution is either
+    # dropping events or counting some twice - and an analyst reading "this file accounted for
+    # 12% of boot I/O" would be reading a number with no denominator. Never checked until now.
+    print("\nthe per-file read totals account for every event the trace declares:")
+    from prefetch_core.artifacts import scan_folder as _scan_folder    # noqa: PLC0415
+
+    traces = [a for a in _scan_folder(corpus.WIN11) if a.kind == "readyboot" and a.io_by_path]
+    check("the folder holds traces to check", len(traces) > 0, True)
+    for art in traces:
+        declared = art.facts.get("events")
+        reads = sum(r for _p, r, _b in art.io_by_path)
+        paths = {p for p, _r, _b in art.io_by_path}
+        check(f"  {art.name}: reads sum to the declared event count",
+              declared is None or int(declared) == reads, f"{reads} vs {declared}")
+        check(f"  {art.name}: no path is counted twice",
+              len(paths) == len(art.io_by_path), len(art.io_by_path) - len(paths))
+
     print("\nvolume identity is correlated across artifacts, and withheld when unsupported:")
-    from prefetch_core.artifacts import correlate_volumes, scan_folder
+    from prefetch_core.artifacts import (correlate_volumes, describe_identities,
+                                     scan_folder)
     rows = correlate_volumes(scan_folder(corpus.WIN11))
     check("one drive letter established", len(rows) == 1, len(rows))
 
@@ -278,7 +304,10 @@ def main():
         a.paths = paths
         a.facts = facts or {}
         return a
-    win = [f"\\WINDOWS\\W{i}.DLL" for i in range(40)]
+    # Machine-specific paths: a match built only from \WINDOWS\ system files cannot show
+    # that two artifacts describe the same machine (AUDIT BUG 105), so a fixture meant to
+    # establish a mapping has to look like a disk somebody actually used.
+    win = [f"\\PROGRAM FILES\\ACME\\W{i}.DLL" for i in range(40)]
     dat = [f"\\DATA\\D{i}.DAT" for i in range(40)]
     two = correlate_volumes([
         _art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in win]
@@ -293,7 +322,7 @@ def main():
           [r.get("volume_serial") for r in two])
 
     # Three ways to get a confident wrong answer out of a percentage. Each must yield nothing.
-    many = [f"\\WINDOWS\\F{i}.DLL" for i in range(40)]
+    many = [f"\\PROGRAM FILES\\ACME\\F{i}.DLL" for i in range(40)]
     generic = ["\\$MFT", "\\SYSTEM VOLUME INFORMATION", "\\$LOGFILE", "\\$RECYCLE.BIN"]
     cases = [
         # One shared path is "100%". A percentage without a count is not evidence.
@@ -314,6 +343,108 @@ def main():
     ]
     for label, arts in cases:
         check(label, correlate_volumes(arts) == [], correlate_volumes(arts))
+
+    # Round 48. A folder can be assembled from two machines - triage output gets merged, and
+    # folders get copied into one place - and every Windows installation shares its system
+    # files. One machine's Layout.ini beside another's ReadyBoot traces produced
+    # `C: = \Device\HarddiskVolume3` at **88.8%**: a confident mapping between a letter on one
+    # disk and a device on another (AUDIT BUG 105).
+    print("\na match built only from stock Windows paths is refused, and says why:")
+    stock = [f"\\WINDOWS\\SYSTEM32\\S{i}.DLL" for i in range(60)]
+    notes = []
+    rows = correlate_volumes([
+        _art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in stock]),
+        _art("layout", [f"C:{p}" for p in stock])], notes)
+    check("no letter is claimed from system files alone", rows == [], rows)
+    check("...and the refusal is reported rather than silent", bool(notes), True)
+    check("...naming what it saw and why it refused",
+          bool(notes) and "stock Windows" in notes[0] and "withheld" in notes[0],
+          notes[:1])
+    rendered = "\n".join(describe_identities(rows, notes))
+    check("...and it reaches the report", "NOT claimed" in rendered, rendered[:120])
+    # Five machine-specific paths are enough to tell one disk from another; four are not.
+    for count, expected in ((5, 1), (4, 0)):
+        mixed = stock + [f"\\PROGRAM FILES\\ACME\\M{i}.EXE" for i in range(count)]
+        got = correlate_volumes([
+            _art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in mixed]),
+            _art("layout", [f"C:{p}" for p in mixed])])
+        check(f"{count} machine-specific path(s) -> {expected} mapping(s)",
+              len(got) == expected, len(got))
+    # And the real folder is unaffected: 1,401 of its 4,238 shared paths are machine-specific.
+    real = correlate_volumes(scan_folder(corpus.WIN11))
+    check("the real corpus still maps its letter", len(real) == 1, len(real))
+
+    # Round 46, feature 7 re-audit. Five ways the correlation misreported an identity.
+    #
+    # BUG 84: the volume-generic filter held its folder names in upper case and compared them
+    # against the path as written. Windows writes `System Volume Information` in mixed case,
+    # so the one rule that stops a letter being mapped by paths present on every volume did
+    # nothing for the spelling that actually occurs.
+    mixed = [f"\\System Volume Information\\x{i}" for i in range(40)]
+    check("mixed-case volume-generic paths claim nothing",
+          correlate_volumes([
+              _art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in mixed]),
+              _art("layout", [f"C:{p}" for p in mixed])]) == [], "mapped on generic paths")
+
+    # BUG 85: devices were accepted in any casing and then grouped case-sensitively, so one
+    # device spelled two ways became two competitors - and the rule that rejects a contested
+    # device threw the true mapping away.
+    half = [f"\\USERS\\BOB\\H{i}.DLL" for i in range(20)]
+    rest = [f"\\USERS\\BOB\\R{i}.DLL" for i in range(20)]
+    spelled_twice = correlate_volumes([
+        _art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in half]
+             + [f"\\DEVICE\\HARDDISKVOLUME3{p}" for p in rest]),
+        _art("layout", [f"C:{p}" for p in half + rest])])
+    check("one device spelled two ways is still one device",
+          len(spelled_twice) == 1 and spelled_twice[0]["drive_letter"] == "C:", spelled_twice)
+
+    # BUG 86: the "one device cannot be two letters" rule counted stated SuperFetch records as
+    # claimants. A folder holding both a database that names \Device\HarddiskVolume3 and the
+    # ReadyBoot/Layout.ini pair that maps C: to it reported NOTHING - the more evidence a
+    # folder carried, the less the tool said.
+    def _sf(device, serial):
+        a = Artifact("synthetic", "superfetch")
+        a.volumes = [{"device": device, "serial": serial, "created": None}]
+        return a
+    both = correlate_volumes([
+        _art("readyboot", [f"\\Device\\HarddiskVolume3{p}" for p in many]),
+        _art("layout", [f"C:{p}" for p in many]),
+        _sf("\\Device\\HarddiskVolume3", "AABBCCDD")])
+    check("a stated record and an inferred letter do not cancel out", len(both) == 1, both)
+    check("the letter is kept and the stated serial attached to it",
+          both and both[0]["drive_letter"] == "C:" and both[0]["volume_serial"] == "AABBCCDD",
+          both)
+    check("and the row says the serial was stated, not matched",
+          both and "stated by the SuperFetch database" in both[0]["basis"],
+          both and both[0]["basis"])
+    # The same record reaches correlation once per database in the folder. Duplicated, the two
+    # copies used to annihilate each other under that same rule.
+    twice = correlate_volumes([_sf("\\Device\\HarddiskVolume2", "885029E6"),
+                               _sf("\\Device\\HarddiskVolume2", "885029E6")])
+    check("a device stated by two databases is reported once, not zero times",
+          len(twice) == 1 and twice[0]["volume_serial"] == "885029E6", twice)
+    # Two databases disagreeing about one device is a conflict to show, not to resolve.
+    conflict = correlate_volumes([_sf("\\Device\\HarddiskVolume2", "885029E6"),
+                                  _sf("\\Device\\HarddiskVolume2", "11112222")])
+    check("conflicting records are both reported", len(conflict) == 2, conflict)
+
+    # BUG 87: a stated row carried shared_paths 0, match 100.0 and next_best 0.0 - numbers no
+    # measurement produced, printed as "0 shared paths - 100.0%" under a fact.
+    check("a stated row measures nothing and says so",
+          twice[0]["shared_paths"] is None and twice[0]["match"] is None
+          and twice[0]["next_best"] is None, twice[0])
+
+    # BUG 88: the CLI and the GUI each rendered these rows themselves, and both labelled a
+    # stated record "Derived by correlation, not read from any file."
+    from prefetch_core.artifacts import describe_identities
+    text = "\n".join(describe_identities(twice))
+    check("a stated-only report does not claim to be inference",
+          "not read from any file" not in text, text)
+    check("...and does not print an empty drive letter",
+          "no drive letter established" in text and " = " not in text, text)
+    letters = "\n".join(describe_identities(both))
+    check("an inferred letter still carries its warning",
+          "not read from any file" in letters, letters)
     if rows:
         row = rows[0]
         check("C: maps to HarddiskVolume3",

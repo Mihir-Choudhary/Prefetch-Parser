@@ -172,9 +172,30 @@ def main(dirs):
         print("  a path the file occupied earlier (Edge updater DOWNLOAD\\{guid} -> INSTALL\\{guid}).")
         print("  Report both - the pair is evidence the binary moved. prefetch-format.md 5a.1.")
 
-    print("\nMATCHES DOCUMENTED RESULT" if ok else "\nDRIFT - docs and measurement disagree")
-    return 0 if ok else 1
+    if ok:
+        print("\nMATCHES DOCUMENTED RESULT")
+        return 0
+    # Each modern file lands in exactly one of these buckets, so their sum is the corpus the
+    # documented figures were measured on. A different total means a different corpus - not
+    # drift in what these files mean, which is what the message used to imply.
+    doc_total = sum(EXPECTED[k] for k in
+                    ("exact", "disambiguated", "conflict", "only_5a", "package", "no_5a"))
+    if total != doc_total:
+        print(f"\nDIFFERENT CORPUS - measured {total} modern files, the documented figures are"
+              f" from {doc_total}.\nEvery count above differs for that reason alone. Point"
+              " PREFETCH_CORPUS_WIN10/WIN11 at the corpus\nthe docs were measured on, or"
+              " re-measure the docs against this one.")
+    else:
+        print("\nDRIFT - same corpus size, different counts: docs and measurement disagree")
+    return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:] or DEFAULT_DIRS))
+    dirs = sys.argv[1:]
+    if not dirs:
+        # The documented counts are measured over both real corpora; measuring nothing
+        # used to print "DRIFT - docs and measurement disagree", blaming the docs for an
+        # unset variable.
+        corpus.require("WIN10", "WIN11")
+        dirs = DEFAULT_DIRS
+    sys.exit(main(dirs))

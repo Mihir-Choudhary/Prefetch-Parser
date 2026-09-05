@@ -62,8 +62,13 @@ def win_basename(p):
 
 
 def main():
+    corpus.require("WIN10", "PECMD")
     out = os.path.join(tempfile.mkdtemp(), "ours.csv")
-    subprocess.run([sys.executable, "-m", "pfcli", "parse", CORPUS, "--csv", out],
+    # `--raw-csv`: this compares VALUES against another tool's output, and the default export
+    # deliberately prefixes cells a spreadsheet would re-read - `1482E648` becomes `'1482E648`
+    # so Excel cannot turn a hash into 1482 x 10^648 (AUDIT BUG 103). The raw export is the one
+    # that promises exact bytes, and it is what a value comparison must use.
+    subprocess.run([sys.executable, "-m", "pfcli", "parse", CORPUS, "--csv", out, "--raw-csv"],
                    cwd=ROOT, check=True, capture_output=True)
 
     csv.field_size_limit(10**9)
@@ -131,6 +136,58 @@ def main():
             ok = False
     if not diffs:
         print("   no differences")
+
+    # A spreadsheet silently truncates any cell over 32,767 characters, and prefetch list
+    # cells go ten times past that. The export cannot raise the limit; it must not let the
+    # truncation happen unremarked (AUDIT BUG 74).
+    print("\ncells a spreadsheet would truncate are reported, not left to chance:")
+    import subprocess as _sp                                          # noqa: PLC0415
+
+    from prefetch_core.output import CellWidths, EXCEL_CELL_LIMIT     # noqa: PLC0415
+
+    widths = CellWidths()
+    for row in rows:
+        widths.note(row)
+    over = sum(widths.over.values())
+    print(f"  widest cell: {widths.widest:,} characters, limit {EXCEL_CELL_LIMIT:,}")
+    print(f"  cells over the limit: {over} in {sorted(widths.over)}")
+    out_again = os.path.join(tempfile.mkdtemp(), "warned.csv")
+    proc = _sp.run([sys.executable, "-m", "pfcli", "parse", corpus.WIN10, "--csv", out_again],
+                   cwd=ROOT, capture_output=True, text=True, timeout=600)
+    # On stderr: diagnostics must not reach the stream a script reads rows from (BUG 107).
+    warned = "TRUNCATED silently" in proc.stderr
+    check_stdout_clean = "TRUNCATED silently" not in proc.stdout
+    print(f"  the export says so on the console: {warned}")
+    if (widths.widest > EXCEL_CELL_LIMIT) != warned or (over > 0) != warned:
+        print("  !! the warning and the measurement disagree")
+        ok = False
+    if not check_stdout_clean:
+        print("  !! the warning reached stdout, where a script reads the rows")
+        ok = False
+
+    # "Read them with a CSV-aware tool" was incomplete advice: Python's csv module refuses a
+    # field over 131,072 characters outright, which reads as a corrupt export rather than a
+    # reader default. The Win10 corpus has a 323,778-character FilesLoaded cell, so the
+    # message must say how to read it (AUDIT BUG 89).
+    from prefetch_core.output import PY_CSV_FIELD_LIMIT                # noqa: PLC0415
+    said = "csv.field_size_limit" in proc.stderr
+    print(f"  widest cell exceeds Python's csv default ({PY_CSV_FIELD_LIMIT:,}): "
+          f"{widths.widest > PY_CSV_FIELD_LIMIT}; the note says how to read it: {said}")
+    if (widths.widest > PY_CSV_FIELD_LIMIT) != said:
+        print("  !! the export does not say what a reader needs to do")
+        ok = False
+    # ...and it stays quiet when nothing needs saying. A note that is always printed is a note
+    # nobody reads.
+    narrow = CellWidths()
+    narrow.note({"A": "x" * 10})
+    if narrow.message is not None:
+        print("  !! a narrow export still emits the warning")
+        ok = False
+    middling = CellWidths()
+    middling.note({"A": "x" * (EXCEL_CELL_LIMIT + 1)})
+    if middling.message is None or "csv.field_size_limit" in middling.message:
+        print("  !! a cell over the spreadsheet limit but under Python's names the wrong limit")
+        ok = False
 
     print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1

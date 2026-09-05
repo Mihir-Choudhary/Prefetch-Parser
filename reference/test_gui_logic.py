@@ -24,11 +24,22 @@ os.environ["XDG_CONFIG_HOME"] = _tempfile.mkdtemp()
 os.environ["APPDATA"] = os.environ["XDG_CONFIG_HOME"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(HERE))
 
 import corpus  # noqa: E402
 
+corpus.require_qt()      # before the import below, so a missing binding skips rather than
+                         # dying with a ModuleNotFoundError that reads like a code fault
+
+from PySide6.QtCore import QSettings as _QSettingsSetup  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
+
+# QSettings' NativeFormat is the **registry** on Windows, so the XDG_CONFIG_HOME/APPDATA
+# redirection above isolates nothing there: this suite would read and write the analyst's real
+# HKCU keys, and the junk-settings checks below would leave them behind. INI format keeps every
+# setting in a file under the temporary directory on every platform.
+_QSettingsSetup.setDefaultFormat(_QSettingsSetup.Format.IniFormat)
 
 from prefetch_core import parse_file  # noqa: E402
 from pfgui.model import COLUMNS, FilterProxy, PrefetchTableModel, row_from  # noqa: E402
@@ -51,6 +62,11 @@ def col(key):
 
 
 def main():
+    # Only what every check here needs. The SuperFetch check below runs against the SuperFetch
+    # databases already sitting in the Win10 corpus; requiring the downloaded Windows 7 sample
+    # as well would skip the theme, filter and readability checks on any machine without it,
+    # which has nothing to do with SuperFetch.
+    corpus.require("WIN10", "WIN11")
     QApplication([])
     files = []
     for p in CORPORA:
@@ -235,6 +251,37 @@ def main():
     check("exported columns exclude hidden ones", len(exported[0]), len(COLUMNS) - 1)
     check("export is a subset, not the whole set", len(exported) - 1 < total, True)
     win3.proxy.clear_filters()
+
+    # Both exports must be atomic and must report a failure rather than raise it out of a Qt
+    # slot. The tagged export had neither: it truncated the previous export before writing a
+    # byte, and an OSError left the slot with no dialog and no file (AUDIT BUG 66/68).
+    print("\nan export that fails keeps the previous one and says so:")
+    import stat as _stat
+    export_dir = _tf.mkdtemp()
+    target = _os.path.join(export_dir, "evidence.csv")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("complete,export\n1,2\n")
+    before = open(target, "rb").read()
+    win13 = MainWindow()
+    win13.load([_os.path.dirname(rows[0]["source_path"])])
+    win13.table.selectRow(0)
+    with patch("pfgui.__main__.QInputDialog.getText", return_value=("keep", True)):
+        win13._tag_selected()
+    _os.chmod(export_dir, _stat.S_IRUSR | _stat.S_IXUSR)      # no new files may be created
+    warned = []
+    try:
+        with patch("pfgui.__main__.QFileDialog.getSaveFileName", return_value=(target, "")), \
+             patch("pfgui.__main__.QMessageBox.warning",
+                    side_effect=lambda *a, **k: warned.append(a[-1])), \
+             patch("pfgui.__main__.QMessageBox.information"):
+            win13._export_tagged()
+            win13._export_view()
+    finally:
+        _os.chmod(export_dir, _stat.S_IRWXU)
+    check("both exports reported the failure instead of raising", len(warned), 2)
+    check("the previous export is untouched", open(target, "rb").read(), before)
+    check("no partial file was left beside it",
+          [f for f in _os.listdir(export_dir) if f.endswith(".partial")], [])
 
     print("\ndetail panes are real tables, not text dumps:")
     from pfgui.detailpanes import SearchableTable
@@ -588,6 +635,219 @@ def main():
     check("a missing path says it could not open", missing_title, ["Cannot open"])
     check("an empty folder still reports a real scan", empty_title, ["Nothing loaded"])
     check("the two are distinguishable", missing_title != empty_title, True)
+
+    print("\nthe folder-artifacts window shows what SuperFetch actually gave us:")
+    # SuperFetch is the artifact this tool used to walk straight past. Whatever it recovers has
+    # to reach a surface a user looks at, or it may as well not be parsed. The Win10 corpus
+    # carries three databases of its own, so this check needs no download.
+    from pfgui.__main__ import MainWindow as _MainWindow              # noqa: PLC0415
+
+    window = _MainWindow()
+    window._load_artifacts([corpus.WIN10])
+    text = window.detail_artifacts.toPlainText()
+    for needle in ("dynrespri.7db", "superfetch",
+                   "558 of 558 declared",              # the record count, not just paths
+                   "structural",                       # which strategy ran, not just that one did
+                   "\\VOLUME{01d8559f7371205e-b0737add}",   # identity the database states itself
+                   "ResPriHMStaticDb.ebd", "scan",     # the undocumented variant, recovered
+                   "2019-12-07"):                      # the inferred per-record timestamps
+        check(f"artifacts window shows {needle!r}", needle in text, True)
+    check("...and the hash-verification count",
+          "name_hashes_verified" in text and "753" in text, True)
+
+    # The Windows 7 family is a different layout entirely (MEM0, 64-bit Vista/7 entries). It
+    # only exists here as a download, so it is an extra check when configured, never a
+    # requirement for the rest of the GUI suite.
+    if corpus.SAMPLES and os.path.isdir(os.path.join(corpus.SAMPLES, "plaso")):
+        window7 = _MainWindow()
+        window7._load_artifacts([os.path.join(corpus.SAMPLES, "plaso")])
+        text7 = window7.detail_artifacts.toPlainText()
+        for needle in ("AgGlGlobalHistory.db", "MEM0",
+                       "10,118 of 10,118 declared",
+                       "HARDDISKVOLUME2", "885029E6"):
+            check(f"artifacts window shows {needle!r} (Win7 sample)", needle in text7, True)
+    else:
+        print("  - the Windows 7 sample is not configured; its extra checks did not run "
+              "(PREFETCH_SAMPLES)")
+
+    # The artifacts window shows tens of thousands of paths and, until Round 45, offered no way
+    # to get any of them out (AUDIT BUG 80). The GUI now writes the same export the CLI does.
+    # A file NAME is chosen by whoever wrote the file. An RTL override in it renders the row as
+    # a different name, and it was the one attacker-influenced string in the grid still shown
+    # raw - and the record was not even flagged as deceptive, because the check looked at the
+    # executable name and not at the file's own (AUDIT BUG 83).
+    print("\na deceptive FILE NAME is escaped and flagged, like every other hostile string:")
+    import shutil as _shutil2                                         # noqa: PLC0415
+
+    from prefetch_core import parse_file as _parse_file2              # noqa: PLC0415
+
+    spoof_dir = _tf.mkdtemp()
+    spoof_name = "INVOICE\u202egnp.exe-12345678.pf"
+    _shutil2.copyfile(_os.path.join(corpus.WIN10, "7ZFM.EXE-7C92DCA0.pf"),
+                      _os.path.join(spoof_dir, spoof_name))
+    spoofed = _parse_file2(_os.path.join(spoof_dir, spoof_name))
+    spoof_row = row_from(spoofed)
+    check("the record is flagged as deceptive", spoofed.deceptive_characters, True)
+    check("...and the grid says so", spoof_row["deceptive_chars"], "YES")
+    for field in ("source_name", "source_path", "problems", "executable_name",
+                  "executable_path", "hosted_package", "executable_path_alt"):
+        check(f"  {field} is escaped for display",
+              "\u202e" in str(spoof_row[field]), False)
+    check("the record itself keeps the raw bytes", "\u202e" in spoofed.source_path, True)
+    win15 = MainWindow()
+    win15.load([spoof_dir])
+    shown = win15.model.data(win15.model.index(0, col("source_name")), Qt.DisplayRole)
+    check("the grid renders the escaped form", "\u202e" in str(shown), False)
+
+    print("\nthe folder's artifacts can leave the window:")
+    import csv as _csv2                                               # noqa: PLC0415
+
+    from prefetch_core.export import summary_path_for                 # noqa: PLC0415
+
+    win14 = MainWindow()
+    win14.load([corpus.WIN10])
+    out_dir = _tf.mkdtemp()
+    target = _os.path.join(out_dir, "artifacts.csv")
+    with patch("pfgui.__main__.QFileDialog.getSaveFileName", return_value=(target, "")), \
+         patch("pfgui.__main__.QMessageBox.information") as told:
+        win14._export_artifacts()
+    check("  the export happened without a dialog complaint", told.called, True)
+    with open(target, newline="", encoding="utf-8") as fh:
+        exported = list(_csv2.DictReader(fh))
+    from prefetch_core.artifacts import scan_folder as _scan          # noqa: PLC0415
+
+    parsed = _scan(corpus.WIN10)
+    expected = sum(len(a.paths) + len([p for p, _r, _b in a.io_by_path
+                                       if p not in set(a.paths)]) for a in parsed)
+    check("  one row per path, matching what was parsed", len(exported), expected)
+    check("  every row names its artifact and kind",
+          all(r["SourceName"] and r["Kind"] for r in exported), True)
+    with open(summary_path_for(target), newline="", encoding="utf-8") as fh:
+        summary_rows = list(_csv2.DictReader(fh))
+    check("  the summary carries one row per artifact", len(summary_rows), len(parsed))
+    check("  ...with the facts that are only in the window otherwise",
+          any(r["Facts"] for r in summary_rows), True)
+
+    # A failure must be reported, and must not leave a half-written pair behind.
+    _os.chmod(out_dir, _stat.S_IRUSR | _stat.S_IXUSR)
+    warned = []
+    try:
+        with patch("pfgui.__main__.QFileDialog.getSaveFileName",
+                   return_value=(_os.path.join(out_dir, "again.csv"), "")), \
+             patch("pfgui.__main__.QMessageBox.warning",
+                   side_effect=lambda *a, **k: warned.append(a[-1])), \
+             patch("pfgui.__main__.QMessageBox.information"):
+            win14._export_artifacts()
+    finally:
+        _os.chmod(out_dir, _stat.S_IRWXU)
+    check("  an unwritable destination is reported, not raised", len(warned), 1)
+    check("  ...and leaves nothing half-written",
+          [f for f in _os.listdir(out_dir) if f.endswith(".partial")], [])
+
+    # Round 46, feature 10 second pass.
+    # Round 48. The clipboard helpers join cells with tabs, so a tab or a newline INSIDE a
+    # value silently rearranges whatever the analyst pastes into - and the likeliest source is
+    # the analyst's own note, which is free text they typed (AUDIT BUG 110).
+    print("\na tab or a newline inside a value cannot rearrange a copied row:")
+    win_copy = MainWindow()
+    win_copy.load([corpus.WIN10])
+    hostile = dict(win_copy.model.rows[0])
+    hostile["note"] = "line one\nline two"
+    hostile["executable_name"] = "EVIL\tNAME.EXE"
+    win_copy.model.rows.append(hostile)
+    win_copy.model.layoutChanged.emit()
+    copied = win_copy._row_text(win_copy.proxy.rowCount() - 1)
+    check("  the row has exactly one tab per column boundary",
+          copied.count("\t"), len(COLUMNS) - 1)
+    check("  ...and holds no newline at all", "\n" in copied, False)
+    check("  ...while still showing that the value contained them",
+          "\\u0009" in copied and "\\u000A" in copied, True)
+    # And the multi-row copy keeps one line per row.
+    block = "\n".join([win_copy._row_text(r) for r in range(win_copy.proxy.rowCount())])
+    check("  a block copy has one line per row", len(block.splitlines()),
+          win_copy.proxy.rowCount())
+
+    print("\nan analyst's tags and notes survive a re-scan of the same folder:")
+    tag_dir = _tf.mkdtemp()
+    for f in sorted(glob.glob(os.path.join(corpus.WIN10, "*.pf")))[:8]:
+        _shutil.copy(f, tag_dir)
+    win15 = MainWindow()
+    win15.load([tag_dir])
+    win15.model.set_tag(0, "★", "ran inside the intrusion window")
+    win15.model.set_tag(1, "★", "second")
+    before = [(r["source_path"], r.get("tag"), r.get("note"))
+              for r in win15.model.rows if r.get("tag")]
+    # The most ordinary action there is: open the same folder again. It used to throw every
+    # tag and note away without a word (AUDIT BUG 91).
+    win15.load([tag_dir])
+    after = [(r["source_path"], r.get("tag"), r.get("note"))
+             for r in win15.model.rows if r.get("tag")]
+    check("  two tagged rows before the re-scan", len(before), 2)
+    check("  the same two, with their notes, after it", after, before)
+    # A file copied in since the last scan must not disturb what is remembered.
+    _shutil.copy(sorted(glob.glob(os.path.join(corpus.WIN11, "*.pf")))[0], tag_dir)
+    win15.load([tag_dir])
+    check("  ...and after a re-scan that finds a new file too",
+          [(r["source_path"], r.get("tag"), r.get("note"))
+           for r in win15.model.rows if r.get("tag")], before)
+    check("  the new file is loaded as well", win15.model.rowCount(), 9)
+
+    print("\nsettings written by another build cannot stop the window opening:")
+    from PySide6.QtCore import QSettings as _QSettings                # noqa: PLC0415
+
+    junk = _QSettings("prefetch-explorer", "pfgui")
+    # A saved header state also carries hidden sections, and an earlier check in this file
+    # leaves one behind. Cleared, so what follows measures the hidden_columns setting alone.
+    junk.remove("header")
+    junk.setValue("hidden_columns", [0, 1, 999, -4, "not a number"])
+    junk.setValue("saved_views", "this is not a dictionary")
+    junk.sync()
+    opened = True
+    try:
+        win16 = MainWindow()                    # __init__ used to raise ValueError here
+        win16.load([tag_dir])
+    except Exception as exc:                    # noqa: BLE001
+        opened = False
+        print(f"    !! {type(exc).__name__}: {exc}")
+    check("  the window opens with nonsense in its settings", opened, True)
+    if opened:
+        hidden = [c for c in range(len(COLUMNS)) if win16.table.isColumnHidden(c)]
+        check("  the two usable indexes are honoured", hidden, [0, 1])
+        check("  the rows still load", win16.model.rowCount(), 9)
+        check("  a string where the saved views belong yields no views",
+              win16._saved_views_setting(), {})
+    # Every column hidden is a window that looks broken with no visible way back, whatever the
+    # file says.
+    try:
+        junk.setValue("hidden_columns", list(range(len(COLUMNS))))
+        junk.sync()
+        win17 = MainWindow()
+        check("  a settings file that hides every column is ignored",
+              [c for c in range(len(COLUMNS)) if win17.table.isColumnHidden(c)], [])
+    finally:
+        # Cleaned up even when a check above fails: settings written by a test must never
+        # outlive it, whatever happened in between.
+        junk.remove("hidden_columns")
+        junk.remove("saved_views")
+        junk.sync()
+
+    print("\nthe program can say what it is, without opening a window:")
+    # A frozen `pfgui --help` used to be taken as a path to load: it started the event loop and
+    # hung forever on a headless machine, which is how the packaging smoke test found it.
+    import subprocess as _sp                                          # noqa: PLC0415
+
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [p for p in (ROOT, corpus.PYLIBS, env.get("PYTHONPATH", "")) if p])
+    helped = _sp.run([sys.executable, "-m", "pfgui", "--help"], cwd=ROOT, env=env,
+                     capture_output=True, text=True, timeout=60)
+    check("--help exits 0", helped.returncode, 0)
+    check("...and prints usage", "usage: pfgui" in helped.stdout, True)
+    check("...naming the CLI as the scriptable half", "pfcli" in helped.stdout, True)
+    started = _sp.run([sys.executable, "-m", "pfgui"], cwd=ROOT,
+                      env=dict(env, PREFETCH_GUI_SELFTEST="1"),
+                      capture_output=True, text=True, timeout=180)
+    check("the self-test start-up exits 0 rather than blocking", started.returncode, 0)
 
     print("\nPASS" if not failures else f"\nFAIL: {failures}")
     return 0 if not failures else 1

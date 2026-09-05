@@ -37,7 +37,8 @@ references:
   documentation; also the cross-check for every ambiguity flagged in `prefetch-format.md`.
 
 **Resolved 2026-08-12:** `../reference/xpress.py` is that pure implementation, written from
-the [MS-XCA] decompression pseudocode. It decompresses all 642 MAM files in ~20 s with no
+the [MS-XCA] decompression pseudocode. It decompresses all 642 MAM files (6 vendored + 184
+Win10 + 452 Win11; 652 counting the 10 compressed downloaded samples) in ~20 s with no
 dependencies, so the cross-platform constraint is no longer a risk — see §6 for the three
 non-obvious bugs a port must avoid.
 

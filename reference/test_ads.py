@@ -60,6 +60,8 @@ class FakeBackend:
 
 
 def main():
+    corpus.require("WIN10")
+    corpus.require_seed(REAL_PF)
     with open(REAL_PF, "rb") as fh:
         pf_bytes = fh.read()
 
@@ -112,6 +114,32 @@ def main():
     check("flagged as outside", outside[0].outside_prefetch_folder, True)
     check("in-folder finding is not flagged", found[0].outside_prefetch_folder, False)
 
+    # Round 46. "Outside the Prefetch folder" is a claim in a report, and both ways of
+    # deciding it were wrong. A false OUTSIDE fabricates a finding; a false INSIDE only omits a
+    # flag from a record the analyst still reads in full - so where it is uncertain, inside.
+    from prefetch_core.ads import _is_outside                          # noqa: PLC0415
+
+    # BUG 93: NTFS is case-insensitive and both paths come off the same volume, but the
+    # comparison was literal - so a folder recorded as `Prefetch` and a carrier path spelled
+    # `prefetch` reported the file as recovered from OUTSIDE the Prefetch folder. A finding
+    # produced by nothing but the spelling of a folder.
+    check("a differently-cased folder is still the same folder",
+          _is_outside("/case/Windows/prefetch/X.pf", "/case/Windows/Prefetch"), False)
+    check("...and a sibling that merely starts the same is not",
+          _is_outside("/case/Windows/Prefetch2/X.pf", "/case/Windows/Prefetch"), True)
+    # BUG 94: with no folder given the test was `"\\prefetch" in path`, by substring. Any
+    # folder called `prefetch` anywhere on the disk counted as THE Prefetch folder and
+    # suppressed the flag - which is the one thing that makes an ADS-hosted prefetch
+    # interesting in the first place.
+    check("a user's own folder named prefetch is not the Prefetch folder",
+          _is_outside(r"C:\Users\bob\Desktop\prefetch\evil.exe", None), True)
+    check("...nor is PrefetchOld", _is_outside(r"C:\Windows\PrefetchOld\x.pf", None), True)
+    check("the real one is recognised in any case",
+          _is_outside(r"c:\windows\prefetch\x.pf", None), False)
+    check("...through a UNC path", _is_outside(r"\\host\c$\Windows\Prefetch\x.pf", None), False)
+    check("...and through a mounted image's path",
+          _is_outside("/evidence/C/Windows/Prefetch/X.pf", None), False)
+
     print("\nTHE TIMESTAMP PROBLEM - the reason this module exists:")
     records = ads.parse_findings(found)
     pf = records[0]
@@ -126,6 +154,110 @@ def main():
           any("CARRIER" in str(p) for p in pf.problems), True)
     check("carrier path recorded", pf.carrier_path, "/case/Prefetch/HOST.TXT")
     check("stream name recorded", pf.stream_name, "PF.pf")
+
+    # An ADS record only means anything with its provenance attached. Until Round 45 neither
+    # export carried any of it: the record landed in the same columns as an ordinary one while
+    # holding the CARRIER's timestamps, with nothing to say so (AUDIT BUG 72).
+    # One entry that refuses to be examined must cost that entry, not the scan. The Windows
+    # backend raises OSError and was handled; the documented off-Windows backend is
+    # `dissect.ntfs`, whose errors are its own types - and one of those ended the entire scan
+    # with nothing reported at all (AUDIT BUG 81).
+    print("\none unreadable entry costs that entry, not the scan:")
+    import tempfile as _tf                                            # noqa: PLC0415
+
+    class Rude:
+        """Raises something that is not an OSError, the way a raw-image backend does."""
+
+        def __init__(self, victim):
+            self.victim = victim
+
+        def list_streams(self, path):
+            if os.path.basename(path) == self.victim:
+                raise ValueError("corrupt MFT entry")
+            return []
+
+        def read_stream(self, stream):
+            return b""
+
+    tree = _tf.mkdtemp()
+    for name in ("a.txt", "victim.txt", "b.txt"):
+        with open(os.path.join(tree, name), "wb") as fh:
+            fh.write(b"x")
+    seen = []
+    result = ads.scan_tree(tree, Rude("victim.txt"),
+                           on_error=lambda p, e: seen.append((os.path.basename(p), e)))
+    check("the scan completes", isinstance(result, list), True)
+    check("the entry that refused is reported", [n for n, _e in seen], ["victim.txt"])
+    check("...with the real reason, not a shrug",
+          isinstance(seen[0][1], ValueError) if seen else False, True)
+    # ...while a missing backend still stops the run: that is a property of the run, not of
+    # one file, and swallowing it would be the false-clean this module exists to prevent.
+    try:
+        ads.scan_tree(tree, None)
+        check("a missing backend still stops the run", False, True)
+    except ads.AdsUnavailable:
+        check("a missing backend still stops the run", True, True)
+
+    print("\nthe provenance survives into both exports:")
+    import sqlite3 as _sqlite3                                        # noqa: PLC0415
+    import tempfile as _tempfile                                      # noqa: PLC0415
+    import csv as _csv                                                # noqa: PLC0415
+
+    from prefetch_core.store import Store as _Store                   # noqa: PLC0415
+    from pfcli.__main__ import CSV_COLUMNS, row_for                   # noqa: PLC0415
+
+    workdir = _tempfile.mkdtemp()
+    db_path = os.path.join(workdir, "ads.db")
+    with _Store(db_path) as st:
+        st.add_all([pf, direct_for_export := parse_file(REAL_PF)])
+    conn = _sqlite3.connect(db_path)
+    conn.row_factory = _sqlite3.Row
+    ads_row = conn.execute("SELECT * FROM prefetch WHERE from_ads = 1").fetchone()
+    normal_row = conn.execute("SELECT * FROM prefetch WHERE from_ads = 0").fetchone()
+    check("the database marks the record as ADS-sourced", ads_row is not None, True)
+    check("...with the carrier file", ads_row["carrier_path"], "/case/Prefetch/HOST.TXT")
+    check("...the stream name", ads_row["stream_name"], "PF.pf")
+    check("...and whose timestamps these are", ads_row["timestamp_source"], "carrier")
+    check("the carrier's modified time round-trips under its own name",
+          ads_row["carrier_modified"],
+          pf.carrier_modified.isoformat(sep=" ") if pf.carrier_modified else None)
+    # The simulated carrier is not a real file, so os.stat gave it no times. Prove the column
+    # actually carries one rather than passing because both sides are empty.
+    stamped = ads.parse_findings(found)[0]
+    stamped.carrier_modified = datetime.datetime(2026, 3, 4, 5, 6, 7,
+                                                 tzinfo=datetime.timezone.utc)
+    stamped_db = os.path.join(workdir, "stamped.db")
+    with _Store(stamped_db) as st2:
+        st2.add(stamped)
+    scon = _sqlite3.connect(stamped_db)
+    check("a carrier time that exists is stored",
+          scon.execute("SELECT carrier_modified FROM prefetch").fetchone()[0],
+          "2026-03-04 05:06:07+00:00")
+    check("...and reaches the CSV too",
+          row_for(stamped)["CarrierModified"], "2026-03-04 05:06:07+00:00")
+    check("...and NOT as the prefetch file's own", ads_row["source_created"], None)
+    check("no first-run estimate is invented for it", ads_row["source_created_est"], None)
+    # An ordinary record has no carrier and no stream - but it does have an answer to "whose
+    # timestamps are these?", and it is "the file's own". Holding NULL there conflated a
+    # measured fact with "not measured" (AUDIT BUG 106).
+    check("an ordinary record names no carrier", normal_row["carrier_path"], None)
+    check("...and says its timestamps are its own",
+          normal_row["timestamp_source"], "stream")
+    check("...while the ADS record says they are the carrier's",
+          ads_row["timestamp_source"], "carrier")
+
+    csv_path = os.path.join(workdir, "ads.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        w = _csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+        w.writeheader()
+        w.writerow(row_for(pf))
+    exported = next(iter(_csv.DictReader(open(csv_path, newline="", encoding="utf-8"))))
+    check("the CSV says the row came from a stream", exported["FromAds"], "1")
+    check("...names the carrier", exported["CarrierPath"], "/case/Prefetch/HOST.TXT")
+    check("...names the stream", exported["StreamName"], "PF.pf")
+    check("...says whose timestamps it carries", exported["TimestampSource"], "carrier")
+    check("...leaves the prefetch file's own creation empty", exported["SourceCreated"], "")
+    check("...and offers no first-run estimate", exported["FirstRunApprox"], "")
 
     print("\nrecovered record parses identically to the same file read normally:")
     direct = parse_file(REAL_PF)
@@ -310,7 +442,12 @@ def main():
             backend32.list_streams(r"C:\case\HOST.TXT")
             check("a mid-enumeration failure raises", False, "returned a truncated list")
         except OSError as exc:
-            check("a mid-enumeration failure raises", exc.errno, 5)
+            # On Windows the four-argument OSError maps winerror onto errno (5 -> EACCES), so
+            # the Win32 code lives in `winerror` there and in `errno` here. Assert the one the
+            # platform actually carries, or the suite reports a defect on its first Windows run
+            # that is nothing but a platform difference.
+            check("a mid-enumeration failure raises",
+                  getattr(exc, "winerror", None) or exc.errno, 5)
 
     print("\nentries that refuse enumeration are reported, not silently skipped:")
     # On a live system these are the in-use and ACL-restricted files - exactly where a payload

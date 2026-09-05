@@ -49,6 +49,7 @@ def win_basename(p):
 
 
 def main():
+    corpus.require("WIN10", "PECMD")
     csv.field_size_limit(10**9)
     with open(PECMD_CSV, newline="", encoding="utf-8-sig") as fh:
         rows = {win_basename(r["SourceFilename"]): r for r in csv.DictReader(fh)}

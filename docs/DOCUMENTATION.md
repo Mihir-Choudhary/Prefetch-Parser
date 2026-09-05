@@ -64,8 +64,26 @@ scanned) from **"could not scan"** — a missing path, or a file passed where a 
 which exits `1`. The first is evidence; the second is not, and `pfcli artifacts "$DIR" && …`
 must not treat them alike.
 
-Exit codes: `0` success, `1` nothing parsed or an output could not be written, `2` alternate
-data streams cannot be enumerated on this host.
+**Streams.** The rows go to **stdout**; every summary, note and error goes to **stderr**, so a
+script can pipe the rows without commentary landing in them.
+
+**The tool's own footprint.** Reading a file updates its access time on a filesystem that
+records one. Timestamps are therefore read **before** the file is opened, so `SourceAccessed` is
+never this tool's own read — but the folder itself is still touched, which is one more reason to
+work from a copy. Nothing is ever written to the evidence directory.
+
+Exit codes, the same for every subcommand:
+
+| Code | Meaning |
+|---|---|
+| `0` | success — including "scanned and found nothing", which is a result |
+| `1` | nothing was produced: no `.pf` files found, a path that does not exist, a file where a folder belongs, or (for `ads`) entries that could not be examined |
+| `2` | the run cannot be started as asked: a capability this host does not have (alternate data streams cannot be enumerated, or a `--decompressor` was forced that is not available), or two outputs aimed at one path — `--db X --csv X`, or a `--db` aimed at the `-summary.csv` that `artifacts --csv` derives. Nothing is parsed and nothing is written first |
+| `120` | the evidence parsed, but an output could not be written. The other outputs are still written — one unwritable destination never costs the other |
+
+`1` and `120` are deliberately different: a script needs to tell "there was nothing" from
+"there was something and the file could not be saved". Every code in this table is asserted in
+`reference/test_cli_errors.py`, so the table and the program cannot drift apart.
 
 ### GUI
 
@@ -101,6 +119,11 @@ Colours are derived from your theme, so they stay legible on light and dark desk
 sortable, filterable, copyable table.
 
 ![Loaded files](images/detail-loaded-files.png)
+
+**Export folder artifacts** (`Ctrl+Shift+R`) writes what that window shows: one CSV row per
+path plus a `-summary.csv` with the facts, the volume records and the problems — the same export
+`pfcli artifacts --csv` produces, from the same code. Both exports are atomic, and the dialog
+says when a cell is too wide for a spreadsheet to hold.
 
 **Folder artifacts** (toolbar or `Ctrl+R`) opens a *separate* window, because it describes the
 whole folder rather than the selected row.
@@ -169,6 +192,11 @@ name is `Publisher.Name_Version_Arch__PublisherHash`.
 | `Dirs` | directories touched |
 | `trace chains` | prefetcher block-load bookkeeping (see the format section) |
 | `MFT references` | NTFS file references for loaded files — entry number and sequence |
+| `Chains` (per loaded file) | how many trace-chain entries **that file** accounts for. The metric entry's first two dwords, which every other tool discards as unknown, are the file's own slice of the chain array — measured to tile it exactly across 284 files |
+| `Fetched` (per loaded file) | a subset of that slice, never larger. Reported as a number; its exact meaning is not established |
+| `Flags` (per loaded file) | a small bitfield that tracks file type — DLLs `0x100`, data files `1`/`2`/`4` |
+| `ResidueBytes` / `ResidueText` | bytes in the file belonging to **no field of it** — fragments of an earlier version of the same record left behind when the prefetcher rewrote it shorter. 134 of 754 corpus files carry some (1,708 bytes in 170 regions), 4–20 bytes each, often a path tail like `TY\RESO`. Bounded on retention — at most 256 regions, 4 KB per region and 64 KB per record kept — while the reported total stays exact. Never merged into the parsed lists |
+| unclaimed MFT references | reference-shaped values found in the declared array past the count it states — 19 of 183 files. Stored with `source='slack'` so a query includes them deliberately |
 
 ### Flags and status
 
@@ -259,7 +287,9 @@ that reason.
 |---|---|
 | `Layout.ini` | UTF-16 list of files the prefetcher wants laid out contiguously. **The only artifact in the folder with a drive letter**, and on Windows 11 it names user accounts and installed software |
 | `PfPre_<hex>.mkd` | a fixed **16,384-slot event ring buffer**. The header count is events *ever written*, so a count above 16,384 means older events were overwritten. The event types are not decoded |
-| `*.7db`, `*.ebd` | SuperFetch resource-priority databases. One self-validating container; `.ebd` is MAM-compressed. Holds paths in prefetch's own `\VOLUME{serial}` notation |
+| `Ag*.db` (+ `.db.trx`) | **SuperFetch databases** — Windows Vista/7/8 names: `AgGlGlobalHistory.db`, `AgAppLaunch.db`, `AgRobust.db`, `AgCx_SC*.db`, `AgGlUAD_<SID>.db`. Tens of thousands of file paths per volume, each volume carrying its serial and creation time. See [SuperFetch](superfetch-format.md) |
+| `*.7db`, `*.ebd` | The same format under the Windows 10/11 names, MAM-compressed in the `.ebd` case. Paths in prefetch's own `\VOLUME{serial}` notation; the static `ResPri*` databases also carry a per-record timestamp |
+| anything else | **reported as unrecognised**, with its size and first bytes. A file present in a collection is a fact about the collection whether or not this tool can parse it |
 | `ReadyBoot/Trace*.fx`, `rblayout.xin` | **per-boot file-access traces.** Fully decompressed — see [ReadyBoot](#readyboot) below. Each file's mtime dates one boot |
 
 Findings measured across 636 real `.pf` files — the two volume notations and the
@@ -374,7 +404,8 @@ compressed and the usual approach calls `ntdll!RtlDecompressBufferEx`, which is 
 reference tool refuses to start on other systems.
 
 This tool ships a **pure-Python XPRESS Huffman decompressor** written from Microsoft's
-[MS-XCA] specification. It decompresses all 642 compressed files in the test corpora with zero
+[MS-XCA] specification. It decompresses all 642 compressed files in the two real corpora plus
+the vendored samples (6 + 184 + 452) with zero
 failures, so Linux and macOS are first-class.
 
 Where `ntdll` is available it is used, chosen by a **capability probe rather than an OS check** —
@@ -388,6 +419,31 @@ Other platform care:
   creation timestamps.
 - All timestamps are UTC; output is byte-identical regardless of the machine's timezone.
 
+### Running on Windows — what to expect
+
+The Windows-only code paths cannot be executed on any other machine, so they are exercised
+against stubs and forced environments by `reference/test_windows_lane.py` (see the suite table
+below). What follows is what an analyst on Windows actually meets.
+
+- **Console output is safe whatever the code page.** Windows gives a *redirected* stream the
+  ANSI code page, not UTF-8, and a Cyrillic or CJK filename printed to it used to end the run
+  with a `UnicodeEncodeError` and no report at all. Redirected output is now written as
+  **UTF-8**; a real console keeps its own encoding and escapes what it cannot draw.
+- **The Prefetch folder needs elevation.** `C:\Windows\Prefetch` is readable only by
+  administrators. Run from an elevated prompt, or point the tool at a collected copy — an
+  unelevated run reports every file as a failed record with a permissions message rather than
+  claiming the folder is empty.
+- **Long paths are handled.** Triage output nests deeply
+  (`C:\Cases\<case>\<host>\<tool>\<timestamp>\C\Windows\Prefetch\…`) and the Win32 file
+  APIs stop at 260 characters. Paths at or past that are addressed through the `\\?\`
+  device-namespace form, which the reported path never carries.
+- **A SQLite database has its own limit**, and it is lower: SQLite holds pathnames in a
+  512-byte buffer, so a `--db` more than ~503 characters deep cannot be opened at all. The
+  error says so, with the length and the remedy — the database does not have to sit beside the
+  evidence.
+- **`pfgui.exe` is a windowed binary**, so it has no console to print to: `pfgui.exe --help`
+  writes nothing on Windows. `pfcli.exe --help` is the console half, and is what a script pipes.
+
 ---
 
 ## Outputs
@@ -395,8 +451,21 @@ Other platform care:
 ### SQLite (`--db`) — the primary artifact
 
 Relational, so nothing is flattened away: `prefetch`, `run_time`, `volume`, `directory`,
-`loaded_file`, `file_ref`, `problem`, plus a `timeline` view of one row per execution. Trace
-chains are stored as a blob rather than millions of rows.
+`loaded_file`, `file_ref`, `residue`, `problem`, plus a `timeline` view of one row per
+execution. Trace chains are stored as a blob rather than millions of rows.
+
+The `prefetch` table also carries the record's **own filesystem timestamps** (`source_created`,
+`source_modified`, `source_accessed`, `source_size`, and `source_created_est` — the documented
+created-minus-10-seconds first-run approximation), the **ADS provenance** of a record recovered
+from a stream (`from_ads`, `carrier_path`, `stream_name`, `timestamp_source`, the carrier's own
+times, and whether the carrier sat outside the Prefetch folder), and the **undecoded regions**
+kept verbatim as blobs (`header_raw`, `fileinfo_raw`, `volume.raw_tail`). All three groups
+existed on the parsed record and reached no export before Round 45 — see `AUDIT.md` BUG 71–73.
+
+A database written by an older build is **upgraded on open**, per table, and the schema version
+is stamped in `PRAGMA user_version`; a database written by a *newer* build is refused with a
+message rather than half-read. Columns added by an upgrade are NULL for rows written before it:
+absent, not measured.
 
 Ingest is **idempotent per source file**, so re-scanning a folder updates rather than
 duplicates. The database is self-contained — journal mode is `DELETE`, not WAL, so a copied
@@ -404,31 +473,83 @@ duplicates. The database is self-contained — journal mode is `DELETE`, not WAL
 
 ### CSV (`--csv`) — an export
 
-A **strict superset of PECmd's columns** — all 27, plus 14 more.
+A **strict superset of PECmd's columns** — all 27, plus 38 more (**65 in total**). Round 45 added
+the last group of them, each one evidence that was in the database and in no export anyone
+opens: the volume self-check verdicts (`VolumeNameChecks`), the references a file does not
+declare (`SlackReferences`, `SlackReferenceCount`), the directory count the file states beside
+the one recovered (`DeclaredDirectoryCount`), the first-run estimate (`FirstRunApprox`), and the
+provenance of a record recovered from an alternate data stream (`FromAds`, `CarrierPath`,
+`StreamName`, `StreamSize`, `TimestampSource` (**every** record answers this: `stream` means
+the file's own times, `carrier` means the host file's, `unavailable` means none could be read),
+`CarrierCreated`, `CarrierModified`,
+`CarrierAccessed`, `CarrierIsPrefetch`, `OutsidePrefetchFolder`). `pfcli ads` takes `--csv` as
+well as `--db`, so a stream finding can be exported without losing what makes it evidence.
+
+Three more came from the audit of the parser and the container: `FilenameHashMatch` and
+`FilenameNameMatch` (the file's name against the record inside it — `ok` / `mismatch` / `n/a`),
+`ContainerTrailingBytes` and `Decompressor` (bytes carried after the compressed stream ended,
+and which decoder measured that — empty means *not measured*), and `DeclaredReferenceCount`
+beside `ReferenceCount` (slots the file declares, against slots that hold a reference).
+
+**Spreadsheets truncate wide cells, silently.** Excel, LibreOffice and Sheets all cap a cell at
+32,767 characters, and drop the rest on import with no warning. Prefetch list cells go far past
+that — the widest in the Windows 10 corpus is **323,778 characters**, ten times the limit — so a
+spreadsheet shows a complete-looking list that is missing most of its entries. The export cannot
+raise the limit, so it reports: every CSV write prints how many cells exceed it and in which
+columns, and the GUI says the same in its export dialog. The file itself and the database hold
+the complete values.
+
+**A wide cell also stops Python's `csv` module**, which refuses any field over **131,072**
+characters with `_csv.Error: field larger than field limit` — a reader default that looks
+exactly like a corrupt export. Where the widest cell passes that mark the note says so and names
+the fix (`csv.field_size_limit()`); pandas, R and `awk` read these files unchanged.
 
 Two safety behaviours, because a filename is attacker-chosen and a forensic CSV is opened in a
 spreadsheet:
 
 - **Formula injection** — a cell starting `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`.
   Values that are simply numbers are left exact. `--raw-csv` disables this.
+- **Silent re-interpretation** — a spreadsheet corrupts more than formulas. Excel reads the
+  hash `1482E648` as 1482 × 10⁶⁴⁸ (**6 of the 452 hashes** in the Windows 11 corpus have that
+  shape), drops the leading zero from `03583356`, turns `3-15` into a date, and loses the low
+  digits of anything past 15. Each is silent, and each changes an identifier that ties a
+  prefetch file to what ran, so those cells get the same `'` prefix. It cannot fire on a
+  quantity — nothing here writes a count in exponent form — and `--raw-csv` disables it.
 - **List cells** hold multiple values separated by ` | `, with a literal `|` escaped as `^p`
   (and `^` as `^^`), so an element containing the separator cannot inject extra entries.
 
 The SQLite store is never sanitised — it is the source of truth.
 
-### What the exports do *not* contain
+### The other artifacts export separately — `pfcli artifacts --db/--csv`
 
-`--db` and `--csv` carry **`.pf` records only**. The other Prefetch-folder artifacts —
-`Layout.ini`, the SuperFetch databases and the ReadyBoot traces, including ReadyBoot's per-file
-I/O totals — are reported by `pfcli artifacts` and the GUI's *Folder artifacts* window, and are
-not written to either export.
+`pfcli parse --db/--csv` carries **`.pf` records only**. The rest of the Prefetch folder —
+`Layout.ini`, the SuperFetch databases, the ReadyBoot traces with their per-file I/O totals,
+`PfPre_*.mkd`, and anything unrecognised — is exported by `pfcli artifacts` instead:
 
-That is deliberate: they are a different kind of evidence (access, not execution) with a
-different shape, and merging them into a per-execution table would invite exactly the
-misreading the whole artifact section is written to prevent. It does mean the fidelity
-guarantee described under [Testing](#testing) — every value in CSV, SQLite, the grid and the
-detail panes matching the parsed record — is a statement about `.pf` records, not about
-artifacts.
+```bash
+pfcli artifacts C:\Windows\Prefetch --db case.db --csv artifacts.csv
+```
+
+- **SQLite**: `artifact`, `artifact_path` (one row per path, with ReadyBoot's read count and
+  byte total in `detail`), `artifact_fact` and `artifact_problem`. Separate tables, not merged
+  into `prefetch`.
+- **CSV**: one row per path, plus a `-summary.csv` beside it with one row per artifact carrying
+  the facts, the volume records and the problems. Two files because repeating an artifact's
+  facts across 10,118 path rows is not an export anyone can read, and dropping them would lose
+  the record counts and the volume identity.
+
+They are kept apart from the `.pf` tables on purpose: these record **access and prefetcher
+priority, not execution**, and putting them in a per-execution table invites exactly the
+misreading the artifact section exists to prevent. Until Round 45 that separation was enforced
+by exporting them *nowhere*, which meant an investigator could see 10,118 SuperFetch paths on
+screen and had no way to get them into a report except by retyping them — see `AUDIT.md`
+BUG 80.
+
+The fidelity guarantee under [Testing](#testing) — every value in CSV, SQLite, the grid and the
+detail panes matching the parsed record — is a statement about `.pf` records. The artifact
+exports have their own check in `test_artifacts`: every artifact, every path, every problem and
+every per-file I/O total that was parsed appears in both exports, and a re-scan does not double
+them.
 
 ### Differences from PECmd, deliberate
 
@@ -454,12 +575,39 @@ export PECMD_CSV=/path/to/PECmd_Output.csv        # optional
 
 Real prefetch contains the account names and installed software of the machine it came from, so
 **the corpora are not in this repository** — their location is configuration. The vendored
-`reference/pf-corpus/` is the upstream project's published sample data.
+`reference/pf-corpus/` is the upstream project's published sample data, and it covers four of
+the five format versions: it is not a substitute for a real collection, and no figure quoted in
+these docs is derived from it alone.
+
+The same three settings can live in a gitignored `corpus-paths.env` at the repository root
+(`KEY=/path` per line), so the configuration outlives the shell that set it. The environment
+wins over the file.
+
+**A suite that cannot run skips — it never passes.** A missing corpus, a stale path, a seed file
+that is not there, or absent Qt bindings all exit `77`, which `run_tests.sh` reports as `SKIP`
+and refuses to count as a pass; the run as a whole then exits non-zero and names what did not
+run. This is the same rule the tool applies to an unscanned folder, and it is pinned by
+`test_harness`.
+
+A suite requires only what **all** of its checks need. `PREFETCH_SAMPLES` — the downloaded
+public samples — is required by `test_superfetch` alone, because those files are its subject;
+every other suite runs on the two corpora and treats sample-only assertions as extras, printing
+which extras did not run. A requirement drawn any wider makes unrelated checks disappear on a
+machine that has real prefetch but no download.
+
+If PySide6 cannot be installed system-wide, put it anywhere and point the suite at it — no
+virtualenv or root required:
+
+```bash
+pip install --break-system-packages --target /some/dir PySide6
+echo "PREFETCH_PYLIBS=/some/dir" >> corpus-paths.env
+```
 
 | Suite | What it pins |
 |---|---|
 | `validate_spec` | an independent parser written from the format doc alone, 683 files |
 | `test_core_vs_spec` | the library agrees with it field-for-field, 690 files, all 5 versions |
+| `test_vendor_truth` | 224 expected values read out of an **independent implementation's** own NUnit tests — the only check in the tree that does not share this project's reading of the format |
 | `fuzz_parser` | 1,464 malformed inputs: no crash, no hang, no silent garbage |
 | `diff_against_pecmd` | agreement with real PECmd output |
 | `test_output_fidelity` | **every value in the CSV, database, grid and detail panes matches the parsed record exactly** |
@@ -468,12 +616,31 @@ Real prefetch contains the account names and installed software of the machine i
 | `test_gui_logic` | filter/sort/tag semantics, contrast on light and dark themes |
 | `test_artifacts` / `test_ads` | non-`.pf` parsing; ADS logic and the carrier-timestamp rule |
 | `test_memory` / `test_layering` / `test_cli_errors` | memory ceiling; the core stays Qt-free; failures are useful |
+| `test_readyboot` | the `PfB` chunk chain decodes to exactly its declared size; crafted chains are refused |
+| `test_superfetch` | `Ag*.db` / `.7db` / `.ebd`: every recovered path verified against its own stored name hash |
+| `test_byte_coverage` | **the parser reads the whole file** — no non-zero byte of any corpus file escapes both the parser and the residue report |
+| `test_windows_lane` | the Windows-only paths, off Windows: the `ntdll` wrapper and `FindFirstStreamW` against stubs (including the ctypes declarations themselves), the `\\?\` long-path transformation, creation-time semantics, and the console encoding that used to kill a run |
+| `test_invariants` | properties only a whole corpus shows: parsing is deterministic, every datetime equals its own FILETIME ticks, every SuperFetch path re-hashes to its stored value, and a folder holding a device node or a FIFO is still reported |
+| `test_harness` | the suite itself: an unrunnable suite skips, and the runner never calls that a pass |
 
 ---
 
 ## Limitations and open questions
 
 Stated plainly, because a forensic tool that hides its limits is worse than one that has them.
+
+### Vista-era SuperFetch, and other things with no sample
+
+`MEMO`/LZNT1 (Windows Vista) is implemented and verified against the published test vectors —
+including a boundary case that was wrong until those vectors were run — but **no real Vista
+database has been through it**, and the tool says so in the compression field rather than
+implying otherwise.
+
+The same applies to `AgRobust.db` (documented to carry prefetch hashes in its source records),
+ReadyBoot `PfB` traces beyond the five in hand, and `PfPre_*.mkd`: no public samples exist. For
+undocumented entry sizes the parser probes the layouts it knows and accepts one **only if the
+stored name hashes verify**, so an unseen variant is either parsed correctly or reported as
+unparsed — never guessed at.
 
 ### Not yet run on Windows
 

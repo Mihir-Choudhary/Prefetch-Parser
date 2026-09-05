@@ -50,6 +50,7 @@ EXPECTED = {
 
 
 def main():
+    corpus.require("WIN10", "WIN11")
     now = datetime.datetime.now(datetime.timezone.utc)
     got = collections.Counter()
     worst = []
@@ -112,8 +113,84 @@ def main():
     for secs, name in worst[:5]:
         print(f"     {secs:8.3f}s  {name}")
 
-    print("\nMATCHES DOCUMENTED RESULT" if ok else "\nDRIFT - docs and measurement disagree")
-    return 0 if ok else 1
+    # A prefetch filename is derived from the executable name and a hash of its path, and the
+    # header holds both independently. Nothing in the tool compared them until Round 45, so a
+    # renamed or planted file - the cheapest anti-forensic move there is - said nothing
+    # (AUDIT BUG 75). On the corpora the two agree everywhere, which is what makes a
+    # disagreement worth reporting.
+    print("\n  the filename against the record's own header:")
+    import shutil as _shutil                                          # noqa: PLC0415
+    import tempfile as _tempfile                                      # noqa: PLC0415
+
+    from prefetch_core import parse_file as _parse_file               # noqa: PLC0415
+
+    agree = disagree = not_applicable = 0
+    corpus_files = [p for d in CORPORA for p in sorted(glob.glob(os.path.join(d, "*.pf")))]
+    for path in corpus_files:
+        rec = _parse_file(path)
+        if rec.filename_hash_match is None and rec.filename_name_match is None:
+            not_applicable += 1
+        elif rec.filename_hash_match is False or rec.filename_name_match is False:
+            disagree += 1
+            print(f"     mismatch: {os.path.basename(path)}")
+        else:
+            agree += 1
+    print(f"     agree {agree}, disagree {disagree}, not applicable {not_applicable}")
+    if disagree:
+        print("     !! a corpus file disagrees with its own header - investigate before "
+              "trusting this run")
+        ok = False
+
+    # And the detection must actually fire. Renaming a real file is the whole scenario.
+    workdir = _tempfile.mkdtemp()
+    planted = os.path.join(workdir, "NOTEPAD.EXE-DEADBEEF.pf")
+    _shutil.copyfile(corpus_files[0], planted)
+    forged = _parse_file(planted)
+    original = _parse_file(corpus_files[0])
+    fires = (forged.filename_hash_match is False and forged.filename_name_match is False
+             and any("renamed" in str(p) for p in forged.problems))
+    print(f"     a renamed copy is detected and says why: {fires}")
+    # ...and everything else about the record must be unchanged by the rename.
+    same = (forged.executable_name == original.executable_name
+            and forged.hash == original.hash
+            and forged.run_times == original.run_times)
+    print(f"     the rename changes nothing else about the record: {same}")
+    ok &= fires and same
+
+    # Round 46: the same rename with an upper-case extension. Windows filenames are
+    # case-insensitive and `pfcli` discovers `.PF` as readily as `.pf`, but the pattern was
+    # case-sensitive - so `NOTEPAD.EXE-DEADBEEF.PF` matched nothing, both fields stayed
+    # "not applicable", and the detection said nothing at all. Defeated by the shift key
+    # (AUDIT BUG 95).
+    shouted = os.path.join(workdir, "NOTEPAD.EXE-DEADBEEF.PF")
+    _shutil.copyfile(corpus_files[0], shouted)
+    loud = _parse_file(shouted)
+    loud_fires = (loud.filename_hash_match is False
+                  and any("renamed" in str(p) for p in loud.problems))
+    print(f"     an upper-case .PF rename is detected too: {loud_fires}")
+    # And an Op-*.pf, which genuinely does not follow the convention, still reports n/a rather
+    # than a mismatch - "not applicable" and "does not match" are different answers.
+    op = os.path.join(workdir, "Op-Something.pf")
+    _shutil.copyfile(corpus_files[0], op)
+    op_rec = _parse_file(op)
+    op_quiet = (op_rec.filename_hash_match is None and op_rec.filename_name_match is None)
+    print(f"     a name outside the convention still reports n/a: {op_quiet}")
+    ok &= loud_fires and op_quiet
+
+    if ok:
+        print("\nMATCHES DOCUMENTED RESULT")
+        return 0
+    # "Drift" means these files changed meaning. A different file COUNT means these are not
+    # those files, and every documented number will differ for that reason alone - so say which
+    # of the two it is rather than accusing the docs.
+    if got["total"] != EXPECTED["total"]:
+        print(f"\nDIFFERENT CORPUS - measured {got['total']} files, the documented figures are"
+              f" from {EXPECTED['total']}.\nEvery count above differs for that reason alone."
+              " Point PREFETCH_CORPUS_WIN10/WIN11 at the corpus\nthe docs were measured on, or"
+              " re-measure the docs against this one.")
+    else:
+        print("\nDRIFT - same corpus size, different counts: docs and measurement disagree")
+    return 1
 
 
 if __name__ == "__main__":

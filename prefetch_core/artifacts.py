@@ -17,10 +17,11 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import stat
 import struct
 from dataclasses import dataclass, field
 
-from . import container
+from . import agdb, container, winpath
 from .limits import MAX_ARTIFACT_BYTES, MAX_DECOMPRESSED_BYTES
 from .xpress import InvalidCompressedData, decompress_pfb
 
@@ -44,6 +45,10 @@ class Artifact:
     problems: list[str] = field(default_factory=list)
     # ReadyBoot only: (path, read count, bytes read) per file, heaviest first.
     io_by_path: list[tuple[str, int, int]] = field(default_factory=list)
+    # SuperFetch only: one dict per volume record - device, serial, creation time, file count.
+    # Structured rather than swept, so correlate_volumes can use it as evidence rather than
+    # re-deriving identity from strings.
+    volumes: list[dict] = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -59,7 +64,9 @@ def identify(name: str, head: bytes) -> str | None:
         return "layout"
     if upper.startswith("PFPRE_") and upper.endswith(".MKD"):
         return "pfpre"
-    if upper.endswith(".7DB") or upper.endswith(".EBD"):
+    if agdb.is_superfetch(name, head):
+        # `.7db`/`.ebd` are Windows 10/11 names; `Ag*.db` is the Vista/7/8 family this tool
+        # used to walk straight past. Same format underneath.
         return "superfetch"
     if head[:4] == READYBOOT_MAGIC:
         return "readyboot"
@@ -160,49 +167,76 @@ def parse_pfpre(path: str, data: bytes) -> Artifact:
 
 
 def parse_superfetch(path: str, data: bytes) -> Artifact:
-    """`*.7db` (plain) and `*.ebd` (MAM-compressed) - one container once decompressed.
+    """SuperFetch databases: `Ag*.db` (Vista/7/8), `*.7db` and `*.ebd` (Windows 10/11).
 
-    Self-validating: the size field equals the decompressed length. Holds UTF-16 paths in
-    prefetch's own `\\VOLUME{serial}` notation, so the serials correlate with .pf volume records.
+    All one format under different names and compression wrappers - see `agdb.py`, which does
+    the parsing and checks every recovered path against its own stored name hash.
+
+    What this yields that the old string sweep did not: the volume each path belongs to, that
+    volume's serial number and **creation time**, the record counts the database declares (so a
+    short read is visible), and on Windows 10/11 static databases a per-file timestamp.
+
+    Still not execution evidence. These are files the prefetcher decided were worth keeping
+    warm; nothing here says a program ran.
     """
     art = Artifact(path, "superfetch")
-    body = data
-    if container.is_container(data):
-        try:
-            body = container.load(data)
-            art.facts["compressed"] = True
-        except Exception as exc:
-            art.problems.append(f"decompression failed: {exc}")
-            return art
-    if len(body) < 32:
-        art.problems.append("too small to hold a header")
-        return art
+    db = agdb.parse(data)
+    art.problems.extend(db.problems)
+    art.paths = sorted(set(db.paths))
 
-    version, total_size, header_size, kind = struct.unpack_from("<4I", body, 0)
-    record_size = struct.unpack_from("<I", body, 20)[0]
-    if total_size != len(body):
-        art.problems.append(f"size field {total_size} != actual {len(body)}")
+    for volume in db.volumes:
+        art.volumes.append({
+            "device": volume.device,
+            "serial": volume.serial_hex,
+            "created": volume.created,
+            "created_ticks": volume.created_ticks,
+            "files": len(volume.files),
+            "declared_files": volume.declared_files,
+        })
 
-    # Extract UTF-16LE strings from the raw bytes rather than decoding the whole buffer and
-    # regexing the text: the buffer is mostly binary records, so a whole-buffer decode splices
-    # unrelated bytes into apparent strings and a path-shaped regex then matches almost nothing
-    # (or the wrong things). Scanning for runs of printable UTF-16 code units is what the
-    # manual analysis did, and it finds the 559 paths in dynrespri.7db that the regex missed.
-    strings = [m.group(0).decode("utf-16-le", errors="replace")
-               for m in re.finditer(rb"(?:[\x20-\x7e]\x00){4,}", body)]
-    art.paths = sorted({s for s in strings if "\\" in s})
-    volumes = sorted({s for s in strings if s.upper().startswith("\\VOLUME{")})
+    # `volumes` stays a comma-joined string for the callers (and the correlation) that have
+    # always read it; the structured records live in art.volumes alongside.
+    volume_names = ",".join(v["device"] for v in art.volumes) or ",".join(
+        sorted({s for s in db.swept_paths if s.upper().startswith("\\VOLUME{")}))
     art.facts.update({
-        "format_version": version,
-        "declared_size": total_size,
-        "size_matches": total_size == len(body),
-        "header_size": header_size,
-        "db_type": kind,
-        "record_size": record_size,
-        "decompressed_size": len(body),
+        "compressed": db.compression != "none",
+        "compression": db.compression,
+        "format_version": db.signature,
+        "db_type": db.db_type,
+        "declared_size": db.declared_size,
+        "size_matches": db.declared_size == db.actual_size,
+        "header_size": db.header_size,
+        "decompressed_size": db.actual_size,
+        "entry_sizes": ",".join(str(x) for x in db.parameters[:3]),
+        "parse_method": db.method,
+        "volume_records": f"{len(db.volumes)} of {db.declared_volumes} declared",
+        "file_records": f"{db.file_count:,} of {db.declared_files:,} declared",
+        "name_hashes_verified": db.hash_verified,
         "paths_found": len(art.paths),
-        "volumes": ",".join(volumes),
+        "volumes": volume_names,
     })
+    # `paths` is a de-duplicated set; `file_records` counts records. When they differ it is
+    # because the same path appears on more than one volume - say so, so nobody reads the
+    # smaller number as records having been lost.
+    if db.file_count and db.file_count != len(art.paths):
+        art.facts["duplicate_paths"] = (
+            f"{db.file_count - len(art.paths)} path(s) recorded on more than one volume; "
+            f"{db.file_count:,} records, {len(art.paths):,} distinct paths")
+
+    if db.declared_sources or db.sources:
+        # Documented to carry process information including prefetch hashes on AgRobust.db.
+        # No database seen here declares any, so the count is reported and nothing is claimed.
+        art.facts["source_records"] = (
+            f"{len(db.sources)} of {db.declared_sources} declared "
+            f"(fields undocumented beyond a hash and a count)")
+    if db.method in ("sweep", "none"):
+        # Never let a fallback read as a full parse: the count means something different.
+        art.facts["file_records"] = f"not parsed structurally ({db.method})"
+    timestamps = [f.recorded for v in db.volumes for f in v.files if f.recorded]
+    if timestamps:
+        art.facts["file_timestamps"] = (
+            f"{len(timestamps):,} records carry a timestamp, "
+            f"{min(timestamps):%Y-%m-%d %H:%M} to {max(timestamps):%Y-%m-%d %H:%M} UTC")
     return art
 
 
@@ -548,11 +582,36 @@ PARSERS = {
 }
 
 
+def _file_kind(mode: int) -> str:
+    """Name what a non-regular path is, so the report says why it was not opened."""
+    for test, name in ((stat.S_ISDIR, "a directory"), (stat.S_ISFIFO, "a FIFO"),
+                       (stat.S_ISCHR, "a character device"), (stat.S_ISBLK, "a block device"),
+                       (stat.S_ISSOCK, "a socket"), (stat.S_ISLNK, "a symbolic link")):
+        if test(mode):
+            return name
+    return "not a regular file"
+
+
 def parse_artifact(path: str) -> Artifact | None:
     """Identify and parse one non-.pf file. Returns None if it is not a known artifact."""
     try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as fh:
+        st = os.stat(winpath.long_path(path))
+        # A FIFO, a device node or a socket in the collected folder: `st_size` lies about all
+        # of them (/dev/zero reports 0), so the ceiling below passed and the unbounded read
+        # that followed grew until the OS killed the process - no report, no exit code, the
+        # analyst's session gone with it. Opening a FIFO does not even get that far: it blocks
+        # forever waiting for a writer (AUDIT BUG 96). Reported without being opened.
+        if not stat.S_ISREG(st.st_mode):
+            # A `.pf` belongs to the prefetch path either way - the same rule as a readable one
+            # below - and it reports the same refusal there. Claiming it here as well would put
+            # one file in two reports.
+            if os.path.basename(path).upper().endswith(".PF"):
+                return None
+            art = Artifact(path, "unreadable")
+            art.problems.append(f"not a regular file ({_file_kind(st.st_mode)}); not opened")
+            return art
+        size = st.st_size
+        with open(winpath.long_path(path), "rb") as fh:
             # Identify from the first bytes only. Deciding whether a file is too large must not
             # itself read it - an earlier version read one byte past the ceiling to detect
             # oversize and so allocated the whole ceiling to refuse it.
@@ -560,15 +619,40 @@ def parse_artifact(path: str) -> Artifact | None:
             data = b""
             if size <= MAX_ARTIFACT_BYTES:
                 fh.seek(0)
-                data = fh.read()
+                # One byte past the ceiling, never `read()`: a file can hold more than the size
+                # it reported, and an unbounded read of it is unbounded memory.
+                data = fh.read(MAX_ARTIFACT_BYTES + 1)
+                if len(data) > MAX_ARTIFACT_BYTES:
+                    art = Artifact(path, identify(os.path.basename(path), head) or "unrecognised")
+                    art.size = size
+                    art.problems.append(
+                        f"file reported {size:,} bytes but holds more than the "
+                        f"{MAX_ARTIFACT_BYTES:,} byte ceiling; not parsed")
+                    return art
     except OSError as exc:
         art = Artifact(path, "unreadable")
         art.problems.append(str(exc))
         return art
 
     kind = identify(os.path.basename(path), head)
-    if kind in (None, "prefetch"):
-        return None
+    if kind == "prefetch":
+        return None                      # parsed as a record, not as an artifact
+    if kind is None:
+        # A file in the Prefetch folder that we do not recognise is still a fact about the
+        # folder. Dropping it silently is how a 2 MB SuperFetch database sat in a collection
+        # while the tool printed "no non-.pf artifacts found" - the same false-clean this
+        # codebase forbids everywhere else. Report it with its size, magic and mtime; that is
+        # enough for an analyst to decide whether it matters.
+        art = Artifact(path, "unrecognised")
+        art.size = size
+        art.facts["first_bytes"] = head[:8].hex(" ")
+        art.problems.append("not a recognised Prefetch-folder artifact; reported, not parsed")
+        try:
+            art.modified = datetime.datetime.fromtimestamp(
+                os.stat(path).st_mtime, datetime.timezone.utc)
+        except OSError:
+            pass
+        return art
     if size > MAX_ARTIFACT_BYTES:
         art = Artifact(path, kind)
         art.size = size
@@ -576,7 +660,16 @@ def parse_artifact(path: str) -> Artifact | None:
             f"file is {size:,} bytes, above the {MAX_ARTIFACT_BYTES:,} byte ceiling; "
             f"not parsed")
         return art
-    art = PARSERS[kind](path, data)
+    parser = PARSERS.get(kind)
+    if parser is None:
+        # `identify` gaining a kind that no parser handles is a programming error, but it must
+        # not reach the user as a KeyError from inside a folder scan: report the file as
+        # recognised-and-unparsed, which is true, and keep the rest of the scan.
+        art = Artifact(path, kind)
+        art.size = size
+        art.problems.append(f"recognised as {kind!r} but this build has no parser for it")
+        return art
+    art = parser(path, data)
     art.size = len(data)
     try:
         art.modified = datetime.datetime.fromtimestamp(
@@ -638,6 +731,29 @@ _VOL_REJECT_MAX = 0.02
 # rests on 4,239 shared paths, so a floor this low cannot lose a genuine mapping while it
 # refuses letters backed by a handful of coincidences.
 _VOL_MIN_SHARED = 20
+# ...and at least this many of those shared paths must be ones a stock Windows would NOT have.
+#
+# `\WINDOWS\SYSTEM32\NTOSKRNL.EXE` is on every Windows installation ever made, so a match built
+# only from system paths says "both of these are Windows", not "both of these are THIS machine".
+# Measured: pointing this at a folder assembled from two different computers - one machine's
+# Layout.ini beside another's ReadyBoot traces - produced `C: = \Device\HarddiskVolume3` at
+# **88.8%**, a confident mapping between a letter on one disk and a device on another. Triage
+# collections get merged, folders get copied into one place, and nothing in the artifacts says
+# which machine they came from (AUDIT BUG 105).
+#
+# The same argument the `$Mft` filter already makes, one level up: paths that exist on every
+# installation identify no particular installation. On the real folder 1,402 of the 4,238 shared
+# paths are machine-specific (Program Files, user profiles, installed software); across the two
+# machines, **zero** of the 79 are. A floor of five separates those by three orders of magnitude
+# while costing nothing on real evidence.
+_VOL_MIN_MACHINE_SPECIFIC = 5
+
+# What every Windows installation has at the top of its system drive. A path whose first
+# component is one of these, with nothing under it, is not evidence about *which* machine.
+_STOCK_WINDOWS_ROOTS = frozenset({
+    "WINDOWS", "PROGRAM FILES", "PROGRAM FILES (X86)", "PROGRAMDATA", "USERS",
+    "PERFLOGS", "$WINDOWS.~BT", "$WINREAGENT",
+})
 _FILETIME_EPOCH = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
 
 # NTFS puts these on *every* volume, so they say nothing about which volume this is. Left in,
@@ -652,21 +768,45 @@ def _normalise(path: str) -> str:
     return path.upper().rstrip("\\")
 
 
+def _machine_specific(path: str) -> bool:
+    """True if this path is one a *stock* Windows installation would not have.
+
+    A path under the Windows directory is excluded outright, and a bare top-level folder every
+    Windows creates (Program Files, Users) carries no more information than its own existence. What is
+    left - installed software, user profiles, anything the owner put there - is what makes one
+    disk distinguishable from another.
+    """
+    parts = [part for part in path.upper().split("\\") if part]
+    if not parts or parts[0] == "WINDOWS":
+        return False
+    return len(parts) > 1 or parts[0] not in _STOCK_WINDOWS_ROOTS
+
+
 def _discriminating(path: str) -> bool:
     """False for paths that exist on every NTFS volume and so identify none of them."""
-    first = path.lstrip("\\").split("\\", 1)[0]
+    # Upper-cased before the comparison. The trace and Layout.ini spell these folders however
+    # Windows wrote them, and `\System Volume Information` in mixed case slipped straight past
+    # a set held in upper case - defeating the one filter that stops a drive letter being
+    # mapped onto a device by paths that identify no volume at all (AUDIT BUG 84).
+    first = path.lstrip("\\").split("\\", 1)[0].upper()
     return bool(first) and not first.startswith("$") and first not in _VOLUME_GENERIC
 
 
-def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
+def correlate_volumes(artifacts: list[Artifact], notes: list | None = None) -> list[dict]:
     """Tie together what each artifact knows about the same volume.
 
-    Returns one row per device for which a drive letter could be established, carrying the
-    letter, the shared-path evidence, and - when the folder offers exactly one candidate - the
-    volume serial and creation time. Everything here is **inferred from correlation**, so each
-    row says what it was derived from.
+    Returns one row per volume the folder can identify. A row is either **stated** - a
+    SuperFetch volume record that names \\Device\\HarddiskVolumeN outright - or **inferred**,
+    a drive letter tied to a device by path overlap. `basis` says which, every time, and the
+    measurement columns of a stated row are None rather than 0: nothing was measured to
+    produce it, and a stated fact must not be dressed up as a 100% match (AUDIT BUG 87).
     """
     by_device: dict[str, set[str]] = {}
+    # Devices are grouped case-insensitively. The input test accepts any casing, so a trace
+    # that spelled one device two ways split it into two competitors - and the rule below that
+    # rejects a contested device then suppressed the true mapping entirely (AUDIT BUG 85). The
+    # first spelling seen is kept for display, so the row still reads as the trace wrote it.
+    spelling: dict[str, str] = {}
     for art in artifacts:
         if art.kind != "readyboot":
             continue
@@ -676,7 +816,9 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
             rest = path[len("\\Device\\"):]
             device, _, tail = rest.partition("\\")
             if tail and _discriminating(tail):
-                by_device.setdefault(device, set()).add(_normalise("\\" + tail))
+                key = device.upper()
+                spelling.setdefault(key, device)
+                by_device.setdefault(key, set()).add(_normalise("\\" + tail))
 
     by_letter: dict[str, set[str]] = {}
     for art in artifacts:
@@ -689,8 +831,35 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
     # Serial and creation time come from the SuperFetch \VOLUME{creation-serial} names, which
     # are the only place in the folder that carries a volume's creation time.
     volumes: list[tuple[str, datetime.datetime | None]] = []
+    stated: list[dict] = []
+    seen: set[tuple] = set()
     for art in artifacts:
         if art.kind != "superfetch":
+            continue
+        for record in art.volumes:
+            # A SuperFetch volume record names the device itself. Where it does, the identity
+            # needs no correlation at all - the database states which serial and creation time
+            # belong to \Device\HarddiskVolumeN. That is stronger evidence than a path-overlap
+            # match and is reported separately, as fact rather than inference.
+            device = str(record.get("device", "")).upper()
+            if device.startswith("\\DEVICE\\"):
+                # A folder holds several SuperFetch databases and they describe the same
+                # volumes, so the same record arrives more than once. Left duplicated, the two
+                # copies cancelled each other out under the contested-device rule below and
+                # the folder's strongest evidence vanished (AUDIT BUG 86).
+                key = (device, record.get("serial"), record.get("created"))
+                if key not in seen:
+                    seen.add(key)
+                    stated.append(record)
+            # The ResPri* static databases describe no real volume: device "Volume Serial
+            # Number : 1", serial 1, no creation time. Counting them as a volume made the
+            # folder look like it held two, which suppressed the serial binding below - the
+            # rule that refuses to guess when more than one volume is present.
+            if not (device.startswith("\\DEVICE\\") or device.startswith("\\VOLUME{")):
+                continue
+            if record.get("serial") and record["serial"] != "00000000":
+                volumes.append((record["serial"].upper(), record.get("created")))
+        if art.volumes:
             continue
         for name in str(art.facts.get("volumes", "")).split(","):
             m = re.match(r"\\VOLUME\{([0-9a-fA-F]+)-([0-9a-fA-F]+)\}", name.strip())
@@ -702,7 +871,7 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
                 microseconds=int(m.group(1), 16) // 10)
             volumes.append((m.group(2).upper(), created))
 
-    rows = []
+    inferred: list[dict] = []
     for letter, letter_paths in sorted(by_letter.items()):
         if not letter_paths:
             continue
@@ -712,14 +881,29 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
             continue
         best = max(scores, key=scores.get)
         others = [s for dev, s in scores.items() if dev != best]
-        shared = len(letter_paths & by_device[best])
+        shared_paths = letter_paths & by_device[best]
+        shared = len(shared_paths)
         if scores[best] < _VOL_MATCH_MIN or any(s > _VOL_REJECT_MAX for s in others):
             continue
         if shared < _VOL_MIN_SHARED:
             continue
-        rows.append({
+        # A match built only from stock Windows paths says "both of these are Windows", not
+        # "both of these are this machine" - and a folder assembled from two computers is
+        # exactly what that looks like (AUDIT BUG 105). Refused, and the refusal is reported:
+        # the analyst must be able to tell "no evidence" from "evidence that proves nothing".
+        specific = sum(1 for path in shared_paths if _machine_specific(path))
+        if specific < _VOL_MIN_MACHINE_SPECIFIC:
+            if notes is not None:
+                notes.append(
+                    f"{letter}: matched \\Device\\{spelling[best]} on {shared:,} shared "
+                    f"path(s), but only {specific} of them are paths a stock Windows would not "
+                    f"have. Every Windows installation shares its system files, so this cannot "
+                    f"show the two artifacts describe the SAME machine - withheld.")
+            continue
+        inferred.append({
             "drive_letter": f"{letter}:",
-            "device": f"\\Device\\{best}",
+            "device": f"\\Device\\{spelling[best]}",
+            "device_key": best,
             "shared_paths": shared,
             "match": round(scores[best] * 100, 1),
             "next_best": round(max(others) * 100, 1) if others else 0.0,
@@ -729,17 +913,104 @@ def correlate_volumes(artifacts: list[Artifact]) -> list[dict]:
     # One device cannot be two drive letters. When two letters both best-match the same device
     # the evidence cannot tell them apart - and with only one device present there is no
     # competing device for the rejection rule above to catch it, so every letter matches. Drop
-    # the whole contested set rather than pick a winner.
+    # the whole contested set rather than pick a winner. Only the inferred rows are counted
+    # here: a stated record claims no letter, so it can never be the second claimant, and
+    # counting it made evidence and inference annihilate each other (AUDIT BUG 86).
     claimed: dict[str, int] = {}
-    for row in rows:
-        claimed[row["device"]] = claimed.get(row["device"], 0) + 1
-    rows = [row for row in rows if claimed[row["device"]] == 1]
+    for row in inferred:
+        claimed[row["device_key"]] = claimed.get(row["device_key"], 0) + 1
+    inferred = [row for row in inferred if claimed[row["device_key"]] == 1]
+
+    # Where the database states the identity of a device an overlap match also found, the two
+    # describe one volume: the letter stays inferred, the serial and creation time become
+    # stated fact. Only when exactly one record names that device - two conflicting records
+    # are reported as they are rather than resolved by guess.
+    # Keyed on the bare device name, upper-cased: that is what by_device keys on. Keeping the
+    # `\Device\` prefix here made every lookup miss, so the merge below never fired and the
+    # stated record and the inferred letter stayed two rows describing one volume.
+    records_for: dict[str, list[dict]] = {}
+    for record in stated:
+        name = str(record["device"]).upper()[len("\\DEVICE\\"):]
+        records_for.setdefault(name, []).append(record)
+    consumed: set[int] = set()
+    for row in inferred:
+        matches = records_for.get(row["device_key"], [])
+        if len(matches) != 1:
+            continue
+        record = matches[0]
+        row["volume_serial"] = record.get("serial", "")
+        row["volume_created"] = record.get("created")
+        row["basis"] = ("letter inferred from ReadyBoot paths matched against Layout.ini; "
+                        "serial and creation time stated by the SuperFetch database")
+        consumed.add(id(record))
+
+    unclaimed = [record for record in stated if id(record) not in consumed]
+    rows: list[dict] = []
+    for record in unclaimed:
+        rows.append({
+            "drive_letter": "",
+            "device": record["device"],
+            # Nothing was measured: no letter was matched to this device. Writing 0 shared
+            # paths and a 100% match printed a self-contradiction under a stated fact.
+            "shared_paths": None,
+            "match": None,
+            "next_best": None,
+            "volume_serial": record["serial"],
+            "volume_created": record.get("created"),
+            "basis": "SuperFetch volume record (stated in the database, not inferred)",
+        })
+    rows += inferred
 
     # Bind the serial only when there is exactly one volume AND exactly one mapped letter.
     # With one volume and two letters there is nothing to say which letter it belongs to, and
     # attaching it to both states as fact that C: and D: are the same volume - a claim that is
-    # necessarily false and would go into a report unchallenged.
-    if len(volumes) == 1 and len(rows) == 1:
-        rows[0]["volume_serial"] = volumes[0][0]
-        rows[0]["volume_created"] = volumes[0][1]
+    # necessarily false and would go into a report unchallenged. A stated record left over
+    # blocks the binding too: that record already claims the folder's one volume for a device
+    # the letter did not match, so binding it to the letter would attach another device's
+    # serial.
+    if len(volumes) == 1 and len(inferred) == 1 and not unclaimed \
+            and not inferred[0].get("volume_serial"):
+        inferred[0]["volume_serial"] = volumes[0][0]
+        inferred[0]["volume_created"] = volumes[0][1]
+        # Said out loud in the row: the letter came from the path overlap, the serial did not.
+        # It is attached because the folder describes exactly one volume, which is a second
+        # and weaker inference, and a reader who is not told will read it as part of the match.
+        inferred[0]["basis"] += ("; serial and creation time from the folder's only SuperFetch "
+                                 "volume record, bound because it is the only one")
+    for row in rows:
+        row.pop("device_key", None)
     return rows
+
+
+def describe_identities(rows: list[dict], notes: list | None = None) -> list[str]:
+    """Render correlate_volumes() rows for a human.
+
+    Shared by the CLI and the GUI. Both wrote their own copy of this, both printed a stated
+    record as `` = \\DEVICE\\HARDDISKVOLUME2`` with an empty letter and "0 shared paths -
+    100.0%", and both ended the block with "Derived by correlation, not read from any file."
+    - which is the opposite of true for a record the database states outright (AUDIT BUG 88).
+    """
+    if not rows and not notes:
+        return []
+    lines = ["Volume identity (correlated across the folder's artifacts):"]
+    for row in rows:
+        if row["drive_letter"]:
+            lines.append(f"    {row['drive_letter']} = {row['device']}")
+            lines.append(f"        {row['shared_paths']:,} shared paths — {row['match']}% of "
+                         f"{row['drive_letter']} paths, next best device {row['next_best']}%")
+        else:
+            lines.append(f"    {row['device']}   (no drive letter established)")
+        if row.get("volume_serial"):
+            created = row.get("volume_created")
+            lines.append(f"        serial {row['volume_serial']}"
+                         + (f", volume created {created:%Y-%m-%d %H:%M:%S} UTC"
+                            if created else ""))
+        lines.append(f"        basis: {row['basis']}")
+    if any(row["drive_letter"] for row in rows):
+        lines.append("    A drive letter is derived by correlation, not read from any file.")
+        lines.append("    Devices with no matching evidence are omitted rather than guessed.")
+    for note in notes or []:
+        # A letter that was matched and then refused is worth more to an analyst than silence:
+        # it says the folder holds evidence that looks like a mapping and is not one.
+        lines.append("    NOT claimed - " + note)
+    return lines

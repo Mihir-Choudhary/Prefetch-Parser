@@ -141,8 +141,11 @@ def row_from(pf) -> Row:
     return Row(
         tag="",
         note="",
-        source_name=pf.source_path.replace("\\", "/").rsplit("/", 1)[-1],
-        source_path=pf.source_path,
+        # Escaped like every other attacker-influenced string here. The FILE NAME is chosen by
+        # whoever wrote the file, so an RTL override in it renders the row as a different name
+        # - and it was the one string in this row shown raw (AUDIT BUG 83).
+        source_name=escape_deceptive(pf.source_path.replace("\\", "/").rsplit("/", 1)[-1]),
+        source_path=escape_deceptive(pf.source_path),
         # Escaped for display: a name carrying an RTL override would otherwise render in the
         # grid as something other than what it is.
         executable_name=escape_deceptive(pf.executable_name),
@@ -154,8 +157,8 @@ def row_from(pf) -> Row:
         last_run=pf.last_run.strftime("%Y-%m-%d %H:%M:%S") if pf.last_run else "",
         executable_path=escape_deceptive(pf.executable_path or ""),
         path_source=pf.path_source.value,
-        hosted_package=pf.hosted_package or "",
-        executable_path_alt=pf.executable_path_alt or "",
+        hosted_package=escape_deceptive(pf.hosted_package or ""),
+        executable_path_alt=escape_deceptive(pf.executable_path_alt or ""),
         volume_count=len(pf.volumes),
         file_count=len(pf.filenames),
         dir_count=sum(len(v.directories) for v in pf.volumes),
@@ -164,7 +167,9 @@ def row_from(pf) -> Row:
         deceptive_chars="YES" if pf.deceptive_characters else "",
         parsed_ok="yes" if pf.parsed_ok else "NO",
         failed_stage=pf.failed_stage or "",
-        problems=" | ".join(str(p) for p in pf.problems),
+        # Problem messages quote the record's own strings - the rename check quotes the
+        # filename - so they carry whatever was in them.
+        problems=escape_deceptive(" | ".join(str(p) for p in pf.problems)),
         _pf=pf,
     )
 

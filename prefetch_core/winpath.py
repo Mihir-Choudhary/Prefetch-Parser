@@ -11,6 +11,8 @@ strings *read out of an artifact*.
 
 from __future__ import annotations
 
+import os
+
 # Both notations appear, and they are two spellings of the same volume:
 #   \DEVICE\HARDDISKVOLUME3\...     - used by the 5a executable-path field
 #   \VOLUME{01d6d2b9...-cc31b5d5}\  - used by filename-list entries and volume records
@@ -65,6 +67,38 @@ _BIDI_CONTROLS = "‪‫‬‭‮⁦⁧⁨⁩‎‏"
 _ZERO_WIDTH = "​‌‍﻿"
 
 
+def readable_text(text: str) -> str:
+    """Render a string that carries undecodable bytes without losing them, and without raising.
+
+    A filename does not have to be valid text. NTFS allows unpaired UTF-16 surrogates, and a
+    Prefetch folder copied out of an image onto Linux carries whatever bytes the name held -
+    `os.walk` hands those back as lone surrogates (`\\udcff`), which is Python telling the truth
+    about a name that is not valid UTF-8.
+
+    Every text output then refuses them: SQLite raises `UnicodeEncodeError` while binding the
+    parameter, and so does the CSV writer. Neither is caught anywhere, so a single such file
+    ended the whole run with a traceback and **no report at all** - the same failure as a device
+    node in the folder, from a name (AUDIT BUG 102).
+
+    The byte is what an examiner needs, so it is what is shown: the string is encoded back to
+    the bytes it came from and re-decoded with escapes, giving `CALC.EXE-3FBEF7FD\\xff.pf`.
+    Where that is impossible - a genuine unpaired surrogate from a UTF-16 name, which no byte
+    sequence produced - the escape names the code point instead. Lossless either way, and never
+    fatal.
+    """
+    if not text or not any("\ud800" <= ch <= "\udfff" for ch in text):
+        return text
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def has_undecodable_bytes(text: str) -> bool:
+    """True if `text` came from a name that is not valid UTF-8 (or not valid UTF-16)."""
+    return bool(text) and any("\ud800" <= ch <= "\udfff" for ch in text)
+
+
 def has_deceptive_characters(text: str) -> bool:
     """True if `text` contains characters that make it display differently than it is stored."""
     if not text:
@@ -74,6 +108,10 @@ def has_deceptive_characters(text: str) -> bool:
 
 def escape_deceptive(text: str) -> str:
     """Render deceptive characters visibly as \\uXXXX so the displayed string is the real one."""
+    # An undecodable byte is the same category of problem as a right-to-left override: a string
+    # that cannot be shown as it is. Rendered first, so every surface that escapes for display
+    # also survives a name that is not valid text (AUDIT BUG 102).
+    text = readable_text(text)
     out = []
     for c in text:
         if c in _BIDI_CONTROLS or c in _ZERO_WIDTH or ord(c) < 32:
@@ -81,6 +119,53 @@ def escape_deceptive(text: str) -> str:
         else:
             out.append(c)
     return "".join(out)
+
+
+# MAX_PATH is 260 characters, and the Win32 file APIs enforce it unless the path carries the
+# `\\?\` prefix - which turns off all normalisation and lets the wide API address up to 32,767
+# characters. Python's `open` and `os.stat` inherit the limit, so a case folder nested deeply
+# enough ("C:\Cases\2026-0043\Evidence\HOST-01\C\Windows\Prefetch\...", plus a triage
+# tool's own timestamped directories) makes EVERY file in it unreadable, with an error that
+# names the file rather than the real cause. 248 rather than 260 because a directory path must
+# leave room for an 8.3 name, which is the threshold Windows itself documents.
+_MAX_PATH_SAFE = 248
+
+
+def _long_path_nt(path: str, extra: int = 0) -> str:
+    """The transformation itself, in Windows path semantics, callable on any host.
+
+    Split out from `long_path` so it can be tested off Windows: `ntpath` applies Windows rules
+    everywhere, while the platform check below cannot be exercised anywhere but Windows. A
+    transformation that only runs on the machine nobody can test is a transformation nobody has
+    ever checked.
+    """
+    import ntpath                                                     # noqa: PLC0415
+
+    if not path or path.startswith("\\\\?\\") or path.startswith("\\\\.\\"):
+        return path                        # already device-namespace; leave it exactly as given
+    absolute = ntpath.abspath(path)
+    # `extra` is what the caller will append before using this path. A temporary file is longer
+    # than the directory that holds it by its prefix, mkstemp's random characters and a suffix,
+    # so a directory comfortably under the limit can still produce a temp path over it - and
+    # the create fails for a target the rename would have handled (AUDIT BUG 99, second half).
+    if len(absolute) + extra < _MAX_PATH_SAFE:
+        return path
+    if absolute.startswith("\\\\"):        # UNC: \\server\share -> \\?\UNC\server\share
+        return "\\\\?\\UNC" + absolute[1:]
+    return "\\\\?\\" + absolute
+
+
+def long_path(path: str, extra: int = 0) -> str:
+    """Return `path` in a form the Win32 file APIs will accept, however long it is.
+
+    A no-op everywhere but Windows, and a no-op on Windows for ordinary lengths - the prefix
+    disables path normalisation, so it is applied only where it is needed. Never store the
+    result: it is an argument for `open`/`os.stat`, not the path to report to an analyst
+    (AUDIT BUG 99).
+    """
+    import sys                                                        # noqa: PLC0415
+
+    return _long_path_nt(path, extra) if sys.platform == "win32" else path
 
 
 def creation_time(stat_result):
