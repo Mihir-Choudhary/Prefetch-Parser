@@ -71,6 +71,57 @@ if ! timeout 120 env QT_QPA_PLATFORM=offscreen PREFETCH_GUI_SELFTEST=1 \
 fi
 echo "  frozen GUI starts Qt: ok"
 
+# The bundle carries Qt and PySide6 (both LGPL-3) and CPython. Redistributing them means
+# shipping their licence texts; a binary that leaves this machine without them is a compliance
+# problem, not a packaging detail. Assembled here rather than by hand, and the build FAILS if
+# any of them is missing - the same rule this project applies to everything else it claims.
+echo
+echo "== collecting the licences the bundle is obliged to carry"
+LICENSES="$OUT/licenses"
+mkdir -p "$LICENSES"
+cp LICENSE "$LICENSES/prefetch-explorer-MIT.txt"
+missing=""
+copy_first() {           # copy_first <destination> <candidate>...
+    dest=$1; shift
+    for candidate in "$@"; do
+        if [ -f "$candidate" ]; then
+            cp "$candidate" "$LICENSES/$dest"
+            return 0
+        fi
+    done
+    missing="$missing $dest"
+    return 1
+}
+copy_first "python-LICENSE.txt" \
+    /usr/lib/python3.14/LICENSE.txt /usr/lib/python3.13/LICENSE.txt \
+    /usr/share/doc/python3.14/copyright
+copy_first "qt6-copyright.txt" \
+    /usr/share/doc/libqt6core6t64/copyright /usr/share/doc/libqt6core6/copyright
+copy_first "pyside6-copyright.txt" \
+    /usr/share/doc/libpyside6-py3-6.10/copyright \
+    /usr/share/doc/python3-pyside6.qtcore/copyright
+copy_first "LGPL-3.txt" /usr/share/common-licenses/LGPL-3
+if [ -n "$missing" ]; then
+    echo "!! licence text missing for:$missing" >&2
+    echo "   The bundle may not be redistributed without it. Install the -doc packages or" >&2
+    echo "   point copy_first at the right paths, then build again." >&2
+    exit 1
+fi
+cat > "$LICENSES/README.txt" <<'NOTICE'
+This bundle contains, in addition to prefetch-explorer itself (MIT, see
+prefetch-explorer-MIT.txt):
+
+  * CPython                    - python-LICENSE.txt
+  * Qt 6 (LGPL-3 or GPL-2)     - qt6-copyright.txt, LGPL-3.txt
+  * PySide6 (LGPL-3)           - pyside6-copyright.txt, LGPL-3.txt
+
+The Qt and PySide6 libraries are shipped as separate shared objects in this
+directory, not statically linked, so they may be replaced with compatible
+builds of your own - which is what the LGPL requires the recipient be able
+to do. Source for Qt and PySide6 is at https://download.qt.io/.
+NOTICE
+echo "  licences collected: $(ls "$LICENSES" | tr '\n' ' ')"
+
 echo
 du -sh "$OUT"
 echo "built: $OUT"
